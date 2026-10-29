@@ -2,10 +2,16 @@
 
 Goodreads lists/bookshelves can be used as a source for autograbbing books.
 Give MLM the URL of the bookshelf page, e.g. `https://www.goodreads.com/review/list/12345678-name?shelf=to-read`.
+The URL has to include a `shelf`, MLM can't import all books of a user.
 
 Goodreads stopped serving the bookshelf RSS feeds in October 2026. MLM now reads the shelf through Goodreads' public
-bookshelf widget instead, which returns the 100 most recently added books. Existing `review/list_rss` URLs keep
-working and don't need to be changed.
+bookshelf widget instead, with these limits:
+- Only the 100 most recently added books of the shelf are read.
+- The widget doesn't use the RSS `key`, so a private profile most likely returns no books. When a shelf comes back
+  without books, MLM logs a warning and skips the list.
+
+Existing `review/list_rss` URLs keep working, don't change them: MLM identifies a list by its URL, so switching an
+existing list to the bookshelf page URL creates a new list and searches all its books again.
 
 Example configuration:
 ```toml
