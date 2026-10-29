@@ -39,15 +39,7 @@ pub async fn run_goodreads_import(
     // Make sure we are only running one import at a time
     let _guard = IMPORT_MUTEX.lock().await;
 
-    let content = reqwest::Client::new()
-        .get(&list.url)
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
-        .send()
-        .await?
-        .bytes()
-        .await?;
-
-    let mut rss: Rss = from_reader(&content[..])?;
+    let mut rss = fetch_list(list).await?;
     trace!("Scanning Goodreads list {}", rss.channel.title);
 
     let list_id = list.list_id()?;
@@ -281,6 +273,179 @@ async fn search_item(
     Ok(selected_torrents)
 }
 
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
+
+static REVIEW_ID_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"/review/show/(\d+)").unwrap());
+static COVER_SIZE_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\._[A-Z]{2}\d+_\.").unwrap());
+static COVER_BOOK_ID_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"/books/\d+[a-z]/(\d+)\.[a-z]+$").unwrap());
+
+async fn fetch_list(list: &GoodreadsList) -> Result<Rss> {
+    // Goodreads stopped serving the shelf RSS feeds (/review/list_rss/...) in October 2026,
+    // read the same shelf through the public bookshelf widget instead
+    let url = widget_url(&list.url)?.unwrap_or_else(|| list.url.clone());
+    let content = reqwest::Client::new()
+        .get(&url)
+        .header("User-Agent", USER_AGENT)
+        .send()
+        .await?
+        .error_for_status()
+        .with_context(|| format!("fetch Goodreads list {url}"))?
+        .text()
+        .await?;
+
+    if content.trim_start().starts_with("var widget_code") {
+        parse_widget(&content, &list.list_id()?).context("parse Goodreads widget")
+    } else {
+        Ok(from_reader(content.as_bytes())?)
+    }
+}
+
+/// Maps a shelf RSS or shelf page url to the equivalent custom widget url
+fn widget_url(rss_url: &str) -> Result<Option<String>> {
+    let link: reqwest::Url = rss_url.parse()?;
+    let Some(user) = link
+        .path()
+        .strip_prefix("/review/list_rss/")
+        .or_else(|| link.path().strip_prefix("/review/list/"))
+    else {
+        return Ok(None);
+    };
+    let user_id: String = user.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if user_id.is_empty() {
+        return Ok(None);
+    }
+    let shelf = link
+        .query_pairs()
+        .find(|(name, _)| name == "shelf")
+        .map(|(_, shelf)| shelf.into_owned())
+        .unwrap_or_else(|| "#ALL#".to_owned());
+
+    let mut url = reqwest::Url::parse(&format!(
+        "https://www.goodreads.com/review/custom_widget/{user_id}"
+    ))?;
+    url.query_pairs_mut()
+        .append_pair("shelf", &shelf)
+        .append_pair("num_books", "100")
+        .append_pair("sort", "date_added")
+        .append_pair("order", "d")
+        .append_pair("show_author", "1")
+        .append_pair("show_cover", "1")
+        .append_pair("show_title", "1")
+        // Without a widget_id Goodreads ignores all other parameters
+        .append_pair("widget_id", "mlm");
+    Ok(Some(url.to_string()))
+}
+
+fn parse_widget(content: &str, list_id: &str) -> Result<Rss> {
+    let (_, code) = content
+        .split_once("var widget_code = '")
+        .context("missing widget_code")?;
+    let fragment = Html::parse_fragment(&unescape_js_string(code)?);
+
+    // Class names end with the widget_id, so match on their prefix
+
+    let header_selector = Selector::parse("[class^=\"gr_custom_header_\"] a").unwrap();
+    let each_selector = Selector::parse("[class^=\"gr_custom_each_container_\"]").unwrap();
+    let book_selector = Selector::parse("[class^=\"gr_custom_book_container_\"] a").unwrap();
+    let cover_selector = Selector::parse("[class^=\"gr_custom_book_container_\"] img").unwrap();
+    let title_selector = Selector::parse("[class^=\"gr_custom_title_\"] a").unwrap();
+    let author_selector = Selector::parse("[class^=\"gr_custom_author_\"] a").unwrap();
+
+    // Keep the title in the same shape as the RSS feed: "Name's bookshelf: shelf"
+    let owner = fragment
+        .select(&header_selector)
+        .next()
+        .map(|e| e.text().collect::<String>())
+        .unwrap_or_default();
+    let owner = owner.trim();
+    let owner = owner.strip_suffix(" books").unwrap_or(owner);
+    let shelf = list_id.split_once(':').map(|(_, s)| s).unwrap_or_default();
+    let title = format!("{owner} bookshelf: {shelf}");
+
+    let mut items = vec![];
+    for each in fragment.select(&each_selector) {
+        let Some(link) = each.select(&book_selector).next() else {
+            continue;
+        };
+        let Some(review_id) = link
+            .attr("href")
+            .and_then(|href| REVIEW_ID_PATTERN.captures(href))
+            .map(|c| c[1].to_owned())
+        else {
+            continue;
+        };
+        let title = link
+            .attr("title")
+            .map(|t| t.to_owned())
+            .or_else(|| {
+                each.select(&title_selector)
+                    .next()
+                    .map(|e| e.text().collect::<String>())
+            })
+            .unwrap_or_default();
+        let cover = each
+            .select(&cover_selector)
+            .next()
+            .and_then(|e| e.attr("src"))
+            .map(|src| COVER_SIZE_PATTERN.replace(src, ".").into_owned());
+        let book_id = cover
+            .as_deref()
+            .and_then(|c| COVER_BOOK_ID_PATTERN.captures(c))
+            .and_then(|c| c[1].parse::<u64>().ok());
+        let author_name = each
+            .select(&author_selector)
+            .next()
+            .map(|e| e.text().collect::<String>().trim().to_owned());
+
+        items.push(Item {
+            // Same guid as the RSS feed used, so existing list items are kept
+            guid: format!(
+                "https://www.goodreads.com/review/show/{review_id}?utm_medium=api&utm_source=rss"
+            ),
+            book_id,
+            title: title.trim().to_owned(),
+            author_name,
+            series: None,
+            book_large_image_url: cover,
+            book_url: book_id.map(|id| format!("https://www.goodreads.com/book/show/{id}")),
+            isbn: None,
+            description: String::new(),
+        });
+    }
+
+    Ok(Rss {
+        channel: Channel { title, items },
+    })
+}
+
+/// Reads a single quoted JS string literal, stopping at the closing quote
+fn unescape_js_string(s: &str) -> Result<String> {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => return Ok(out),
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('u') => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    out.push(
+                        char::from_u32(u32::from_str_radix(&hex, 16)?)
+                            .context("invalid unicode escape")?,
+                    );
+                }
+                Some(c) => out.push(c),
+                None => break,
+            },
+            c => out.push(c),
+        }
+    }
+    Err(anyhow::Error::msg("unterminated widget_code string"))
+}
+
 #[derive(Debug, Deserialize)]
 struct Rss {
     channel: Channel,
@@ -301,6 +466,8 @@ struct Item {
     author_name: Option<String>,
     series: Option<(String, f64)>,
     book_large_image_url: Option<String>,
+    #[serde(skip)]
+    book_url: Option<String>,
     // book_description: String,
     isbn: Option<String>,
     description: String,
@@ -325,11 +492,16 @@ impl Item {
         let user_list_selector =
             Selector::parse("a[href^=\"https://www.goodreads.com/book/show/\"]").unwrap();
         let group_list_selector = Selector::parse("a[href^=\"/book/show/\"]").unwrap();
-        let book_url = fragment
-            .select(&user_list_selector)
-            .next()
-            .and_then(|e| e.attr("href"))
-            .map(|s| s.to_string())
+        let book_url = self
+            .book_url
+            .clone()
+            .or_else(|| {
+                fragment
+                    .select(&user_list_selector)
+                    .next()
+                    .and_then(|e| e.attr("href"))
+                    .map(|s| s.to_string())
+            })
             .or_else(|| {
                 fragment
                     .select(&group_list_selector)
@@ -431,5 +603,116 @@ fn check_cost(
         }
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WIDGET: &str = r#"  var widget_code = '  <div class=\"gr_custom_container_mlm\">\n    <h2 class=\"gr_custom_header_mlm\">\n    <a style=\"text-decoration: none;\" rel=\"nofollow\" href=\"https://www.goodreads.com/review/list/1-jane-doe?shelf=to-read&amp;utm_medium=api&amp;utm_source=custom_widget\">Jane&#39;s books<\/a>\n    <\/h2>\n      <div class=\"gr_custom_each_container_mlm\">\n          <div class=\"gr_custom_book_container_mlm\">\n            <a title=\"The Example Book (Example Series #3)\" rel=\"nofollow\" href=\"https://www.goodreads.com/review/show/1000000001?utm_medium=api&amp;utm_source=custom_widget\"><img alt=\"The Example Book\" border=\"0\" src=\"https://i.gr-assets.com/images/S/compressed.photo.goodreads.com/books/1700000000l/87654321._SY75_.jpg\" /><\/a>\n          <\/div>\n          <div class=\"gr_custom_title_mlm\">\n            <a rel=\"nofollow\" href=\"https://www.goodreads.com/review/show/1000000001?utm_medium=api&amp;utm_source=custom_widget\">The Example Book<\/a>\n          <\/div>\n          <div class=\"gr_custom_author_mlm\">\n            by <a rel=\"nofollow\" href=\"https://www.goodreads.com/author/show/1000.Ann_Author\">Ann Author<\/a>\n          <\/div>\n      <\/div>\n      <div class=\"gr_custom_each_container_mlm\">\n          <div class=\"gr_custom_book_container_mlm\">\n            <a title=\"Don&#39;t Look Back\" rel=\"nofollow\" href=\"https://www.goodreads.com/review/show/123?utm_medium=api&amp;utm_source=custom_widget\"><img alt=\"Don&#39;t Look Back\" border=\"0\" src=\"https://s.gr-assets.com/assets/nophoto/book/50x75-a91bf249278a81aabab721ef782c4a74.png\" /><\/a>\n          <\/div>\n          <div class=\"gr_custom_author_mlm\">\n            by <a rel=\"nofollow\" href=\"https://www.goodreads.com/author/show/1.A_B\">A.B. Writer<\/a>\n          <\/div>\n      <\/div>\n  <\/div>\n'
+  var widget_div = document.getElementById('gr_custom_widget_')
+"#;
+
+    #[test]
+    fn test_widget_url() {
+        let url = widget_url(
+            "https://www.goodreads.com/review/list_rss/12345678?key=KEY&shelf=to-read",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://www.goodreads.com/review/custom_widget/12345678?shelf=to-read&num_books=100&sort=date_added&order=d&show_author=1&show_cover=1&show_title=1&widget_id=mlm"
+        );
+        assert!(
+            widget_url("https://www.goodreads.com/review/list_rss/12345678-jane-doe")
+                .unwrap()
+                .unwrap()
+                .contains("/custom_widget/12345678?shelf=%23ALL%23&")
+        );
+        assert!(
+            widget_url("https://www.goodreads.com/review/list/12345678-jane-doe?shelf=to-read")
+                .unwrap()
+                .unwrap()
+                .contains("/custom_widget/12345678?shelf=to-read&")
+        );
+        assert_eq!(
+            widget_url("https://www.goodreads.com/group/bookshelf/1.rss").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_widget() {
+        let rss = parse_widget(WIDGET, "1:to-read").unwrap();
+        assert_eq!(rss.channel.title, "Jane's bookshelf: to-read");
+        assert_eq!(rss.channel.items.len(), 2);
+
+        let item = &rss.channel.items[0];
+        assert_eq!(
+            item.guid,
+            "https://www.goodreads.com/review/show/1000000001?utm_medium=api&utm_source=rss"
+        );
+        assert_eq!(item.title, "The Example Book (Example Series #3)");
+        assert_eq!(item.author_name.as_deref(), Some("Ann Author"));
+        assert_eq!(item.book_id, Some(87654321));
+        assert_eq!(
+            item.book_large_image_url.as_deref(),
+            Some(
+                "https://i.gr-assets.com/images/S/compressed.photo.goodreads.com/books/1700000000l/87654321.jpg"
+            )
+        );
+        assert_eq!(
+            item.book_url.as_deref(),
+            Some("https://www.goodreads.com/book/show/87654321")
+        );
+
+        let item = &rss.channel.items[1];
+        assert_eq!(item.title, "Don't Look Back");
+        assert_eq!(item.author_name.as_deref(), Some("A.B. Writer"));
+        assert_eq!(item.book_id, None);
+        assert_eq!(item.book_url, None);
+    }
+
+    /// Fetches a real shelf through the widget, run with
+    /// GOODREADS_RSS_URL=... cargo test -p mlm live_widget -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn live_widget() {
+        let rss_url = std::env::var("GOODREADS_RSS_URL").unwrap();
+        let url = widget_url(&rss_url).unwrap().unwrap();
+        let content = reqwest::Client::new()
+            .get(&url)
+            .header("User-Agent", USER_AGENT)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let list_id = GoodreadsList {
+            url: rss_url,
+            name: None,
+            prefer_format: None,
+            grab: vec![],
+            search_interval: None,
+            unsat_buffer: None,
+            wedge_buffer: None,
+            dry_run: true,
+        }
+        .list_id()
+        .unwrap();
+        let rss = parse_widget(&content, &list_id).unwrap();
+        println!("{list_id}: {} ({} items)", rss.channel.title, rss.channel.items.len());
+        for item in &rss.channel.items {
+            println!(
+                "{} | {} | {:?} | {:?}",
+                item.guid, item.title, item.author_name, item.book_id
+            );
+        }
+        assert!(!rss.channel.items.is_empty());
     }
 }

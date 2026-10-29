@@ -1,12 +1,16 @@
 # Goodreads Import
 
 Goodreads lists/bookshelves can be used as a source for autograbbing books.
-On the bookshelf page, use the RSS icon: ![](https://s.gr-assets.com/assets/links/rss-d17345b73ab0388f7a23933239a75efb.gif) to get the URL to give to MLM.
+Give MLM the URL of the bookshelf page, e.g. `https://www.goodreads.com/review/list/12345678-name?shelf=to-read`.
+
+Goodreads stopped serving the bookshelf RSS feeds in October 2026. MLM now reads the shelf through Goodreads' public
+bookshelf widget instead, which returns the 100 most recently added books. Existing `review/list_rss` URLs keep
+working and don't need to be changed.
 
 Example configuration:
 ```toml
 [[goodreads_list]]
-url = "https://www.goodreads.com/review/list_rss/..." # RSS feed of a Goodreads list
+url = "https://www.goodreads.com/review/list/..." # A Goodreads bookshelf page, or an old list_rss feed URL
 
 [[goodreads_list.grab]] # A block deciding what torrents to grab from the list,
                         # if a torrent matches multiple blocks, the first one is used
