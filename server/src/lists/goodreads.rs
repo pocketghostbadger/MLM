@@ -46,7 +46,7 @@ pub async fn run_goodreads_import(
 
     if rss.channel.items.is_empty() {
         warn!(
-            "Goodreads list {list_id} has no books, check that the shelf exists and the profile is public"
+            "Goodreads list {list_id} has no books, check that the shelf name is right"
         );
         return Ok(());
     }
