@@ -5,10 +5,13 @@ Give MLM the URL of the bookshelf page, e.g. `https://www.goodreads.com/review/l
 The URL has to include a `shelf`, MLM can't import all books of a user.
 
 Goodreads stopped serving the bookshelf RSS feeds in October 2026. MLM now reads the shelf through Goodreads' public
-bookshelf widget instead, with these limits:
-- Only the 100 most recently added books of the shelf are read.
-- The widget doesn't use the RSS `key`, so a private profile most likely returns no books. When a shelf comes back
-  without books, MLM logs a warning and skips the list.
+bookshelf widget instead. This only sees public data, so it can't do everything the RSS feeds could:
+- Private shelves most likely can't be imported any more. The RSS `key` used to give MLM access to a private profile,
+  but the widget doesn't use it. Making the shelf public makes it work again, but also makes your reading list
+  visible to everyone. When a shelf comes back without books, MLM logs a warning and skips the list.
+- Only the 100 most recently added books of the shelf are read. This isn't new: the RSS feeds were also limited to
+  the 100 newest books, and MLM only ever read one page of them. Books MLM has seen stay on the list after they drop
+  out of the newest 100.
 
 Existing `review/list_rss` URLs keep working, don't change them: MLM identifies a list by its URL, so switching an
 existing list to the bookshelf page URL creates a new list and searches all its books again.
