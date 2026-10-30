@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use bytes::Bytes;
 use lava_torrent::torrent::v1::Torrent;
 use mlm_db::{
@@ -162,6 +162,8 @@ pub enum NotGrabbed {
     NotOnMam,
     #[error("Torrent was already snatched, so no wedge is used on it")]
     AlreadySnatched,
+    #[error("Torrent is no longer free, expected: {0:?}")]
+    NoLongerFree(TorrentCost),
 }
 
 /// Whether a grab error would come back on every later pass, so the selection is dropped
@@ -182,7 +184,7 @@ fn already_free(info: &MaMTorrent) -> bool {
 /// agree with `decide_spend`, which takes a missing lookup to mean that MaM didn't return it
 fn needs_lookup(cost: TorrentCost, wedges: u64, wedge_buffer: u64) -> bool {
     match cost {
-        TorrentCost::GlobalFreeleech | TorrentCost::PersonalFreeleech | TorrentCost::Vip => false,
+        TorrentCost::GlobalFreeleech | TorrentCost::PersonalFreeleech | TorrentCost::Vip => true,
         TorrentCost::UseWedge | TorrentCost::TryWedge => wedges > wedge_buffer,
         TorrentCost::Ratio => false,
     }
@@ -191,9 +193,9 @@ fn needs_lookup(cost: TorrentCost, wedges: u64, wedge_buffer: u64) -> bool {
 /// Decides what grabbing a selection spends. `info` is the torrent as MaM returns it now,
 /// looked up when `needs_lookup` says so.
 ///
-/// No wedge is used on a torrent that's already free or VIP, or on one that was already
-/// snatched, which is probably in a client already. Free costs are checked against MaM once the
-/// torrent file is in hand.
+/// A selection that was free when it was picked is only grabbed while it's still free. No wedge
+/// is used on a torrent that's already free or VIP, or on one that was already snatched, which
+/// is probably in a client already.
 fn decide_spend(
     cost: TorrentCost,
     wedges: u64,
@@ -202,7 +204,11 @@ fn decide_spend(
 ) -> Result<Spend, NotGrabbed> {
     match cost {
         TorrentCost::GlobalFreeleech | TorrentCost::PersonalFreeleech | TorrentCost::Vip => {
-            Ok(Spend::Nothing)
+            match info {
+                None => Err(NotGrabbed::NotOnMam),
+                Some(info) if already_free(info) => Ok(Spend::Nothing),
+                Some(_) => Err(NotGrabbed::NoLongerFree(cost)),
+            }
         }
         TorrentCost::Ratio => Ok(Spend::Ratio),
         TorrentCost::UseWedge | TorrentCost::TryWedge => {
@@ -291,7 +297,9 @@ async fn grab_torrent(
                 );
                 (spend == Spend::Wedge, None)
             }
-            Err(err @ NotGrabbed::AlreadySnatched) => (false, Some(err)),
+            Err(err @ (NotGrabbed::AlreadySnatched | NotGrabbed::NoLongerFree(_))) => {
+                (false, Some(err))
+            }
             Err(err) => return Err(err.into()),
         };
     if will_wedge {
@@ -372,21 +380,6 @@ async fn grab_torrent(
 
     if let Some(err) = refused {
         return Err(err.into());
-    }
-
-    if !matches!(
-        torrent.cost,
-        TorrentCost::Ratio | TorrentCost::UseWedge | TorrentCost::TryWedge
-    ) {
-        let Some(torrent_info) = mam.get_torrent_info(&hash).await? else {
-            return Err(anyhow!("Could not get torrent from MaM"));
-        };
-        if !torrent_info.is_free() {
-            return Err(anyhow!(
-                "Torrent is no longer free, expected: {:?}",
-                torrent.cost
-            ));
-        }
     }
 
     mam.add_unsats(1).await;
@@ -679,19 +672,31 @@ mod tests {
 
     #[test]
     fn test_spend_without_wedge() {
+        let [plain, free, personal, vip, snatched, free_snatched] = infos();
         assert!(!needs_lookup(TorrentCost::Ratio, 1, 0));
         assert_eq!(
             decide_spend(TorrentCost::Ratio, 1, 0, None),
             Ok(Spend::Ratio)
         );
-        // Free costs are checked against MaM once the torrent file is in hand
+
         for cost in [
             TorrentCost::GlobalFreeleech,
             TorrentCost::PersonalFreeleech,
             TorrentCost::Vip,
         ] {
-            assert!(!needs_lookup(cost, 1, 0));
-            assert_eq!(decide_spend(cost, 1, 0, None), Ok(Spend::Nothing));
+            // Free costs are checked before the torrent file is downloaded, wedges or not
+            assert!(needs_lookup(cost, 1, 0));
+            assert!(needs_lookup(cost, 0, 0));
+            for info in [&free, &personal, &vip, &free_snatched] {
+                assert_eq!(decide_spend(cost, 0, 0, Some(info)), Ok(Spend::Nothing));
+            }
+            for info in [&plain, &snatched] {
+                assert_eq!(
+                    decide_spend(cost, 1, 0, Some(info)),
+                    Err(NotGrabbed::NoLongerFree(cost))
+                );
+            }
+            assert_eq!(decide_spend(cost, 1, 0, None), Err(NotGrabbed::NotOnMam));
         }
     }
 
@@ -725,6 +730,9 @@ mod tests {
         assert!(drops_selection(&anyhow::Error::new(NotGrabbed::NotOnMam)));
         assert!(drops_selection(&anyhow::Error::new(
             NotGrabbed::AlreadySnatched
+        )));
+        assert!(drops_selection(&anyhow::Error::new(
+            NotGrabbed::NoLongerFree(TorrentCost::GlobalFreeleech)
         )));
         // Wedges can come back, so that's tried again
         assert!(!drops_selection(&anyhow::Error::new(
