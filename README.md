@@ -1,3 +1,7 @@
+> **Fork note:** This is a personal fork of [CampingAvocado/MLM](https://github.com/CampingAvocado/MLM), kept running for my own use. It adds a fix for Goodreads lists after Goodreads removed shelf RSS feeds in October 2026 (see [docs/src/goodreads.md](docs/src/goodreads.md)). The Docker image is `ghcr.io/pocketghostbadger/mlm:main` (amd64 only); no Windows build or docs site is published from this fork. No support or maintenance is promised.
+>
+> The original note from CampingAvocado follows.
+
 > **Note:**
 > This began as a personal fork of the MLM project by StirlingMouse to fix a few minor issues.
 > Because the original author took down their repository, this is now the only surviving, up-to-date version of the code.
