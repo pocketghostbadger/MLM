@@ -271,46 +271,13 @@ async fn search_item(
         rw.commit()?;
     }
 
-    // With one unsat slot left, leave the second format for the next run
-    if max_torrents == 1 && audiobook.is_some() && ebook.is_some() {
-        ebook = None;
-    }
-
-    let mut has_updates = false;
-    if let Some(found) = audiobook
-        && db_item
-            .audio_torrent
-            .as_ref()
-            .is_none_or(|t| !(t.status == TorrentStatus::Selected && t.mam_id == found.0.id))
-    {
-        db_item.audio_torrent = Some(ListItemTorrent {
-            mam_id: found.0.id,
-            status: TorrentStatus::Selected,
-            at: Timestamp::now(),
-        });
-        has_updates = true;
-    }
-    if let Some(found) = ebook
-        && db_item
-            .ebook_torrent
-            .as_ref()
-            .is_none_or(|t| !(t.status == TorrentStatus::Selected && t.mam_id == found.0.id))
-    {
-        db_item.ebook_torrent = Some(ListItemTorrent {
-            mam_id: found.0.id,
-            status: TorrentStatus::Selected,
-            at: Timestamp::now(),
-        });
-        has_updates = true;
-    }
-    if !list.dry_run && has_updates {
-        let (_guard, rw) = db.rw_async().await?;
-        rw.upsert(db_item.clone())?;
-        rw.commit()?;
-    }
-
     let mut selected_torrents = 0;
     if let Some(audiobook) = audiobook {
+        if mark_selected(&mut db_item.audio_torrent, audiobook) && !list.dry_run {
+            let (_guard, rw) = db.rw_async().await?;
+            rw.upsert(db_item.clone())?;
+            rw.commit()?;
+        }
         selected_torrents += select_torrents(
             config,
             db,
@@ -328,7 +295,15 @@ async fn search_item(
         .await
         .context("select_torrents")?;
     }
-    if let Some(ebook) = ebook {
+    // When the audiobook took the last unsat slot, the ebook waits for the next run
+    if let Some(ebook) = ebook
+        && selected_torrents < max_torrents
+    {
+        if mark_selected(&mut db_item.ebook_torrent, ebook) && !list.dry_run {
+            let (_guard, rw) = db.rw_async().await?;
+            rw.upsert(db_item.clone())?;
+            rw.commit()?;
+        }
         selected_torrents += select_torrents(
             config,
             db,
@@ -340,7 +315,7 @@ async fn search_item(
             list.wedge_buffer,
             None,
             list.dry_run,
-            max_torrents.saturating_sub(selected_torrents),
+            max_torrents - selected_torrents,
             item.book_id,
         )
         .await
@@ -698,6 +673,25 @@ fn select_torrent(
                 .flatten()
                 .find(|t| t.1.media_type.matches(main_cat.into()))
         })
+}
+
+/// Records a torrent as selected for a list item, returns whether that changed the item
+fn mark_selected(
+    field: &mut Option<ListItemTorrent>,
+    found: &(MaMTorrent, TorrentMeta, usize, Grab),
+) -> bool {
+    if field
+        .as_ref()
+        .is_some_and(|t| t.status == TorrentStatus::Selected && t.mam_id == found.0.id)
+    {
+        return false;
+    }
+    field.replace(ListItemTorrent {
+        mam_id: found.0.id,
+        status: TorrentStatus::Selected,
+        at: Timestamp::now(),
+    });
+    true
 }
 
 fn not_wanted(
