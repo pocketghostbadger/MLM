@@ -22,7 +22,7 @@ pub async fn run_notion_import(
     db: Arc<Database<'_>>,
     mam: Arc<MaM<'_>>,
     list: &NotionList,
-    max_torrents: u64,
+    mut max_torrents: u64,
 ) -> Result<()> {
     // Make sure we are only running one import at a time
     let _guard = IMPORT_MUTEX.lock().await;
@@ -42,7 +42,7 @@ pub async fn run_notion_import(
 
     trace!("Scanning Notion list {}", list.name);
 
-    for item in content.results.into_iter() {
+    'item: for item in content.results.into_iter() {
         let mam_ids = list
             .mam_fields
             .iter()
@@ -58,6 +58,10 @@ pub async fn run_notion_import(
             .collect::<Vec<u64>>();
 
         'torrent: for mam_id in mam_ids {
+            // This run has used all its unsat slots, look up the rest on the next one
+            if max_torrents == 0 {
+                break 'item;
+            }
             let torrent = db
                 .r_transaction()?
                 .get()
@@ -67,12 +71,13 @@ pub async fn run_notion_import(
             }
 
             let mam_torrent = mam.get_torrent_info_by_id(mam_id).await?;
+            sleep(Duration::from_millis(400)).await;
             if let Some(torrent) = mam_torrent {
                 for grab in &list.grab {
                     if !grab.filter.matches(&torrent) {
                         continue;
                     }
-                    select_torrents(
+                    let selected = select_torrents(
                         &config,
                         &db,
                         &mam,
@@ -88,10 +93,10 @@ pub async fn run_notion_import(
                     )
                     .await
                     .context("select_torrents")?;
+                    max_torrents = max_torrents.saturating_sub(selected);
                     continue 'torrent;
                 }
             }
-            sleep(Duration::from_millis(400)).await;
         }
     }
 
