@@ -621,11 +621,12 @@ pub async fn select_torrents<T: Iterator<Item = MaMTorrent>>(
 }
 
 /// The cost a torrent is selected with, or None when its grab block's cost doesn't allow
-/// downloading it. A torrent's own flags come first, so a free torrent is stored as free whatever
-/// the block's cost
+/// downloading it. The VIP and freeleech flags come first, so a torrent with one of them is stored
+/// as VIP or freeleech whatever the block's cost
 fn selection_cost(cost: Cost, torrent: &MaMTorrent) -> Option<TorrentCost> {
     let torrent_cost = match cost {
         Cost::MetadataOnly | Cost::MetadataOnlyAdd => return None,
+        Cost::Free if !torrent.is_free() => return None,
         _ if torrent.vip => TorrentCost::Vip,
         _ if torrent.personal_freeleech => TorrentCost::PersonalFreeleech,
         _ if torrent.free => TorrentCost::GlobalFreeleech,
@@ -633,8 +634,7 @@ fn selection_cost(cost: Cost, torrent: &MaMTorrent) -> Option<TorrentCost> {
         Cost::TryWedge => TorrentCost::TryWedge,
         Cost::Ratio => TorrentCost::Ratio,
         // Free through fl_vip only, which the downloader checks the same way as VIP
-        Cost::Free if torrent.fl_vip => TorrentCost::Vip,
-        Cost::Free => return None,
+        Cost::Free => TorrentCost::Vip,
     };
     Some(torrent_cost)
 }
@@ -872,6 +872,10 @@ mod tests {
             fl_vip: true,
             ..Default::default()
         };
+        let vip_only = MaMTorrent {
+            vip: true,
+            ..Default::default()
+        };
 
         // Free torrents are stored as free, whatever the block's cost
         for cost in [Cost::Free, Cost::Wedge, Cost::TryWedge, Cost::Ratio] {
@@ -886,6 +890,19 @@ mod tests {
             assert_eq!(selection_cost(cost, &vip), Some(TorrentCost::Vip));
         }
         assert_eq!(selection_cost(Cost::Free, &fl_vip), Some(TorrentCost::Vip));
+        // Other blocks store a torrent that's free only through fl_vip by their own cost
+        assert_eq!(
+            selection_cost(Cost::Wedge, &fl_vip),
+            Some(TorrentCost::UseWedge)
+        );
+        assert_eq!(
+            selection_cost(Cost::TryWedge, &fl_vip),
+            Some(TorrentCost::TryWedge)
+        );
+        assert_eq!(
+            selection_cost(Cost::Ratio, &fl_vip),
+            Some(TorrentCost::Ratio)
+        );
 
         // Other torrents take the block's cost, and free blocks skip them
         assert_eq!(
@@ -901,6 +918,13 @@ mod tests {
             Some(TorrentCost::Ratio)
         );
         assert_eq!(selection_cost(Cost::Free, &plain), None);
+
+        // VIP without any of the free flags isn't free for a free block. Other blocks store it as
+        // VIP, as before
+        assert_eq!(selection_cost(Cost::Free, &vip_only), None);
+        for cost in [Cost::Wedge, Cost::TryWedge, Cost::Ratio] {
+            assert_eq!(selection_cost(cost, &vip_only), Some(TorrentCost::Vip));
+        }
 
         // Metadata only blocks don't download anything
         for cost in [Cost::MetadataOnly, Cost::MetadataOnlyAdd] {

@@ -175,8 +175,9 @@ fn drops_selection(err: &anyhow::Error) -> bool {
             .is_some_and(|err| !matches!(err, NotGrabbed::FewerWedges { .. }))
 }
 
-/// Whether downloading a torrent spends nothing. `fl` would still spend a wedge on VIP torrents
-fn already_free(info: &MaMTorrent) -> bool {
+/// Whether a wedge would be wasted on a torrent: it's free already, or it's VIP, where `fl` would
+/// still spend one. Not a check that downloading it is free, which is `is_free()`
+fn wedge_not_needed(info: &MaMTorrent) -> bool {
     info.is_free() || info.vip
 }
 
@@ -206,7 +207,7 @@ fn decide_spend(
         TorrentCost::GlobalFreeleech | TorrentCost::PersonalFreeleech | TorrentCost::Vip => {
             match info {
                 None => Err(NotGrabbed::NotOnMam),
-                Some(info) if already_free(info) => Ok(Spend::Nothing),
+                Some(info) if info.is_free() => Ok(Spend::Nothing),
                 Some(_) => Err(NotGrabbed::NoLongerFree(cost)),
             }
         }
@@ -220,7 +221,7 @@ fn decide_spend(
             } else {
                 match info {
                     None => NotGrabbed::NotOnMam,
-                    Some(info) if already_free(info) => return Ok(Spend::Nothing),
+                    Some(info) if wedge_not_needed(info) => return Ok(Spend::Nothing),
                     Some(info) if info.my_snatched => NotGrabbed::AlreadySnatched,
                     Some(_) => return Ok(Spend::Wedge),
                 }
@@ -697,6 +698,32 @@ mod tests {
                 );
             }
             assert_eq!(decide_spend(cost, 1, 0, None), Err(NotGrabbed::NotOnMam));
+        }
+    }
+
+    #[test]
+    fn test_vip_without_free_flags() {
+        let vip_only = MaMTorrent {
+            vip: true,
+            ..Default::default()
+        };
+        // A free selection is only grabbed while one of the free flags is set
+        for cost in [
+            TorrentCost::GlobalFreeleech,
+            TorrentCost::PersonalFreeleech,
+            TorrentCost::Vip,
+        ] {
+            assert_eq!(
+                decide_spend(cost, 1, 0, Some(&vip_only)),
+                Err(NotGrabbed::NoLongerFree(cost))
+            );
+        }
+        // But no wedge is used on it, since `fl` spends one even on VIP torrents
+        for cost in [TorrentCost::UseWedge, TorrentCost::TryWedge] {
+            assert_eq!(
+                decide_spend(cost, 1, 0, Some(&vip_only)),
+                Ok(Spend::Nothing)
+            );
         }
     }
 
