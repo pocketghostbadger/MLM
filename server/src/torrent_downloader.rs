@@ -5,9 +5,12 @@ use bytes::Bytes;
 use lava_torrent::torrent::v1::Torrent;
 use mlm_db::{
     DatabaseExt as _, ErroredTorrentId, Event, EventType, SelectedTorrent, Size, Timestamp,
-    TorrentCost,
+    TorrentCost, TorrentKey,
 };
-use mlm_mam::api::{MaM, RateLimitError};
+use mlm_mam::{
+    api::{MaM, RateLimitError},
+    search::MaMTorrent,
+};
 use native_db::Database;
 use qbit::{
     models::Torrent as QbitTorrent,
@@ -96,14 +99,11 @@ pub async fn grab_selected_torrents(
         // here it gets checked if a blocked message gets returned
         let account_blocked = result.as_ref().err().is_some_and(|err| err.is::<AccountBlockedError>());
                 
-        // A stale dl link can't be grabbed on a later pass either, so drop the
-        // selection instead of asking the site for it every run. It stays on the
-        // errors page, and restoring it from the selected page retries.
-        if result
-            .as_ref()
-            .err()
-            .is_some_and(|err| err.downcast_ref::<StaleDlLink>().is_some())
-        {
+        // A stale dl link, or a torrent that can't be grabbed at its cost, can't be
+        // grabbed on a later pass either, so drop the selection instead of asking the
+        // site for it every run. It stays on the errors page, and restoring it from
+        // the selected page retries.
+        if result.as_ref().err().is_some_and(drops_selection) {
             let (_guard, rw) = db.rw_async().await?;
             if let Some(mut stale) = rw.get().primary::<SelectedTorrent>(torrent.mam_id)? {
                 stale.removed_at = Some(Timestamp::now());
@@ -145,6 +145,103 @@ pub(crate) fn ratio_room(uploaded: f64, downloaded: f64, downloading: f64, min_r
     uploaded / min_ratio - downloaded - downloading
 }
 
+/// What grabbing a selection spends, decided before its torrent file is downloaded
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Spend {
+    Nothing,
+    Wedge,
+    Ratio,
+}
+
+/// Why a selection wasn't grabbed
+#[derive(thiserror::Error, Debug, PartialEq, Eq)]
+pub enum NotGrabbed {
+    #[error("Fewer wedges ({wedges}) than wedge_buffer ({wedge_buffer})")]
+    FewerWedges { wedges: u64, wedge_buffer: u64 },
+    #[error("Could not get torrent from MaM")]
+    NotOnMam,
+    #[error("Torrent was already snatched, so no wedge is used on it")]
+    AlreadySnatched,
+}
+
+/// Whether a grab error would come back on every later pass, so the selection is dropped
+/// instead of retried. Wedges can come back, so running out of them is retried
+fn drops_selection(err: &anyhow::Error) -> bool {
+    err.is::<StaleDlLink>()
+        || err
+            .downcast_ref::<NotGrabbed>()
+            .is_some_and(|err| !matches!(err, NotGrabbed::FewerWedges { .. }))
+}
+
+/// Whether downloading a torrent spends nothing. `fl` would still spend a wedge on VIP torrents
+fn already_free(info: &MaMTorrent) -> bool {
+    info.is_free() || info.vip
+}
+
+/// Whether deciding what a selection spends needs the torrent as MaM returns it now. This has to
+/// agree with `decide_spend`, which takes a missing lookup to mean that MaM didn't return it
+fn needs_lookup(cost: TorrentCost, wedges: u64, wedge_buffer: u64) -> bool {
+    match cost {
+        TorrentCost::GlobalFreeleech | TorrentCost::PersonalFreeleech | TorrentCost::Vip => false,
+        TorrentCost::UseWedge | TorrentCost::TryWedge => wedges > wedge_buffer,
+        TorrentCost::Ratio => false,
+    }
+}
+
+/// Decides what grabbing a selection spends. `info` is the torrent as MaM returns it now,
+/// looked up when `needs_lookup` says so.
+///
+/// No wedge is used on a torrent that's already free or VIP, or on one that was already
+/// snatched, which is probably in a client already. Free costs are checked against MaM once the
+/// torrent file is in hand.
+fn decide_spend(
+    cost: TorrentCost,
+    wedges: u64,
+    wedge_buffer: u64,
+    info: Option<&MaMTorrent>,
+) -> Result<Spend, NotGrabbed> {
+    match cost {
+        TorrentCost::GlobalFreeleech | TorrentCost::PersonalFreeleech | TorrentCost::Vip => {
+            Ok(Spend::Nothing)
+        }
+        TorrentCost::Ratio => Ok(Spend::Ratio),
+        TorrentCost::UseWedge | TorrentCost::TryWedge => {
+            let no_wedge = if wedges <= wedge_buffer {
+                NotGrabbed::FewerWedges {
+                    wedges,
+                    wedge_buffer,
+                }
+            } else {
+                match info {
+                    None => NotGrabbed::NotOnMam,
+                    Some(info) if already_free(info) => return Ok(Spend::Nothing),
+                    Some(info) if info.my_snatched => NotGrabbed::AlreadySnatched,
+                    Some(_) => return Ok(Spend::Wedge),
+                }
+            };
+            // try_wedge still downloads, on ratio, when it can't use a wedge
+            if cost == TorrentCost::TryWedge {
+                Ok(Spend::Ratio)
+            } else {
+                Err(no_wedge)
+            }
+        }
+    }
+}
+
+/// The event for a torrent that was grabbed, or that a wedge was used on
+fn grabbed_event(hash: String, torrent: &SelectedTorrent, wedged: bool) -> Event {
+    Event::new(
+        Some(hash),
+        Some(torrent.mam_id),
+        EventType::Grabbed {
+            grabber: torrent.grabber.clone(),
+            cost: Some(torrent.cost),
+            wedged,
+        },
+    )
+}
+
 #[instrument(skip_all)]
 async fn grab_torrent(
     config: &Config,
@@ -159,32 +256,58 @@ async fn grab_torrent(
         torrent.meta.title, torrent.category, torrent.tags,
     );
 
+    // Nothing needs to be sent for a torrent that's already in the library
+    let library_existing = {
+        let r = db.r_transaction()?;
+        r.get()
+            .secondary::<mlm_db::Torrent>(TorrentKey::mam_id, torrent.mam_id)?
+    };
+    if library_existing.is_some_and(|existing| existing.library_path.is_some()) {
+        debug!(
+            "Torrent \"{}\" is already in the library",
+            torrent.meta.title
+        );
+        let (_guard, rw) = db.rw_async().await?;
+        rw.remove(torrent)?;
+        rw.commit()?;
+        return Ok(());
+    }
+
     let user_info = mam.user_info().await?;
     let wedge_buffer = torrent.wedge_buffer.unwrap_or(config.wedge_buffer);
-    let will_wedge =
-        if torrent.cost == TorrentCost::UseWedge || torrent.cost == TorrentCost::TryWedge {
-            if user_info.wedges <= wedge_buffer {
-                if torrent.cost == TorrentCost::UseWedge {
-                    return Err(anyhow::Error::msg(format!(
-                        "Fewer wedges ({}) than wedge_buffer ({})",
-                        user_info.wedges, wedge_buffer
-                    )));
-                }
-                false
-            } else {
-                let already_free = mam
-                    .get_torrent_info_by_id(torrent.mam_id)
-                    .await?
-                    .map(|t| t.is_free() || t.vip)
-                    .unwrap_or(false);
-                !already_free
+    let info = if needs_lookup(torrent.cost, user_info.wedges, wedge_buffer) {
+        mam.get_torrent_info_by_id(torrent.mam_id).await?
+    } else {
+        None
+    };
+    // A torrent that isn't grabbed at its cost may still be in a client already. It's then
+    // recorded like any other duplicate, after downloading its torrent file without `fl`
+    let (will_wedge, refused) =
+        match decide_spend(torrent.cost, user_info.wedges, wedge_buffer, info.as_ref()) {
+            Ok(spend) => {
+                debug!(
+                    "Grabbing torrent \"{}\" spends {spend:?}",
+                    torrent.meta.title
+                );
+                (spend == Spend::Wedge, None)
             }
-        } else {
-            false
+            Err(err @ NotGrabbed::AlreadySnatched) => (false, Some(err)),
+            Err(err) => return Err(err.into()),
         };
+    if will_wedge {
+        info!("Using wedge on torrent \"{}\"", torrent.meta.title);
+    }
+    let fresh_dl_link = info.as_ref().and_then(|info| info.dl.as_deref());
     let (torrent_file_bytes, torrent_file) =
-        fetch_torrent_file(db, mam, &torrent, will_wedge).await?;
+        fetch_torrent_file(db, mam, &torrent, will_wedge, fresh_dl_link).await?;
     let hash = torrent_file.info_hash();
+    // The wedge is spent now, so it shows up even if the torrent is a duplicate or can't be added
+    if will_wedge {
+        if let Some((_, user_info)) = mam.user.lock().await.as_mut() {
+            user_info.wedges = user_info.wedges.saturating_sub(1);
+        }
+        write_event(db, grabbed_event(hash.clone(), &torrent, true)).await;
+    }
 
     if let Some(qbit_torrent) = get_existing_qbit_torrent(config, qbit, qbit_url, &hash).await {
         let is_completed = matches!(
@@ -247,17 +370,14 @@ async fn grab_torrent(
         return Ok(());
     }
 
-    let mut wedged = false;
-    if will_wedge {
-        info!("Using wedge on torrent \"{}\"", torrent.meta.title);
-        wedged = true;
-        if let Some((_, user_info)) = mam.user.lock().await.as_mut() {
-            user_info.wedges = user_info.wedges.saturating_sub(1);
-        }
-    } else if torrent.cost != TorrentCost::Ratio
-        && torrent.cost != TorrentCost::UseWedge
-        && torrent.cost != TorrentCost::TryWedge
-    {
+    if let Some(err) = refused {
+        return Err(err.into());
+    }
+
+    if !matches!(
+        torrent.cost,
+        TorrentCost::Ratio | TorrentCost::UseWedge | TorrentCost::TryWedge
+    ) {
         let Some(torrent_info) = mam.get_torrent_info(&hash).await? else {
             return Err(anyhow!("Could not get torrent from MaM"));
         };
@@ -290,9 +410,7 @@ async fn grab_torrent(
     )
     .await?;
 
-    let mam_id = torrent.mam_id;
-    let cost = Some(torrent.cost);
-    let grabber = torrent.grabber.clone();
+    let event = (!will_wedge).then(|| grabbed_event(hash.clone(), &torrent, false));
     {
         let (_guard, rw) = db.rw_async().await?;
         rw.upsert(mlm_db::Torrent {
@@ -322,19 +440,9 @@ async fn grab_torrent(
         rw.commit()?;
     }
 
-    write_event(
-        db,
-        Event::new(
-            Some(hash),
-            Some(mam_id),
-            EventType::Grabbed {
-                grabber,
-                cost,
-                wedged,
-            },
-        ),
-    )
-    .await;
+    if let Some(event) = event {
+        write_event(db, event).await;
+    }
 
     Ok(())
 }
@@ -388,13 +496,22 @@ pub struct StaleDlLink;
 
 /// Fetch and parse a torrent file, refreshing the stored dl link once if what
 /// comes back isn't a torrent. A dl hash goes stale after a while, and the site
-/// then answers with something that isn't bencode at all.
+/// then answers with something that isn't bencode at all. A dl link the site
+/// returned just now is used instead of the stored one, and isn't refreshed.
 async fn fetch_torrent_file(
     db: &Database<'_>,
     mam: &MaM<'_>,
     torrent: &SelectedTorrent,
     wedge: bool,
+    fresh_dl_link: Option<&str>,
 ) -> Result<(Bytes, Torrent)> {
+    if let Some(dl_link) = fresh_dl_link {
+        let bytes = get_mam_torrent_file(mam, dl_link, torrent.mam_id, wedge).await?;
+        let parsed =
+            Torrent::read_from_bytes(bytes.clone()).map_err(|_| anyhow::Error::new(StaleDlLink))?;
+        return Ok((bytes, parsed));
+    }
+
     let bytes = get_mam_torrent_file(mam, &torrent.dl_link, torrent.mam_id, wedge).await?;
     if let Ok(parsed) = Torrent::read_from_bytes(bytes.clone()) {
         return Ok((bytes, parsed));
@@ -483,5 +600,139 @@ mod tests {
             let ratio = uploaded / (downloaded + downloading + room);
             assert!((ratio - min_ratio).abs() < 1e-9, "{min_ratio}: {ratio}");
         }
+    }
+
+    /// A torrent as MaM returns it: plain, free, personal freeleech, VIP, snatched, and free
+    /// and snatched
+    fn infos() -> [MaMTorrent; 6] {
+        [
+            MaMTorrent::default(),
+            MaMTorrent {
+                free: true,
+                fl_vip: true,
+                ..Default::default()
+            },
+            MaMTorrent {
+                personal_freeleech: true,
+                ..Default::default()
+            },
+            MaMTorrent {
+                vip: true,
+                fl_vip: true,
+                ..Default::default()
+            },
+            MaMTorrent {
+                my_snatched: true,
+                ..Default::default()
+            },
+            MaMTorrent {
+                free: true,
+                fl_vip: true,
+                my_snatched: true,
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn test_spend_wedge() {
+        let [plain, free, personal, vip, snatched, free_snatched] = infos();
+        for cost in [TorrentCost::UseWedge, TorrentCost::TryWedge] {
+            // The torrent is only looked up when there's a wedge to spend
+            assert!(needs_lookup(cost, 1, 0));
+            assert!(!needs_lookup(cost, 0, 0));
+            assert!(!needs_lookup(cost, 2, 2));
+
+            assert_eq!(decide_spend(cost, 1, 0, Some(&plain)), Ok(Spend::Wedge));
+            assert_eq!(decide_spend(cost, 3, 2, Some(&plain)), Ok(Spend::Wedge));
+            // No wedge on torrents that are already free, `fl` would spend one on VIP too
+            for info in [&free, &personal, &vip, &free_snatched] {
+                assert_eq!(decide_spend(cost, 1, 0, Some(info)), Ok(Spend::Nothing));
+            }
+        }
+
+        // No wedge either on a torrent that was already snatched, or that MaM doesn't return, or
+        // when wedges run out. wedge isn't grabbed then, try_wedge falls back to ratio
+        let wedge = |wedges, wedge_buffer, info| {
+            decide_spend(TorrentCost::UseWedge, wedges, wedge_buffer, info)
+        };
+        let try_wedge = |wedges, wedge_buffer, info| {
+            decide_spend(TorrentCost::TryWedge, wedges, wedge_buffer, info)
+        };
+        assert_eq!(
+            wedge(1, 0, Some(&snatched)),
+            Err(NotGrabbed::AlreadySnatched)
+        );
+        assert_eq!(try_wedge(1, 0, Some(&snatched)), Ok(Spend::Ratio));
+        assert_eq!(wedge(1, 0, None), Err(NotGrabbed::NotOnMam));
+        assert_eq!(try_wedge(1, 0, None), Ok(Spend::Ratio));
+        assert_eq!(
+            wedge(2, 2, None),
+            Err(NotGrabbed::FewerWedges {
+                wedges: 2,
+                wedge_buffer: 2
+            })
+        );
+        assert_eq!(try_wedge(2, 2, None), Ok(Spend::Ratio));
+        assert_eq!(try_wedge(0, 0, None), Ok(Spend::Ratio));
+    }
+
+    #[test]
+    fn test_spend_without_wedge() {
+        assert!(!needs_lookup(TorrentCost::Ratio, 1, 0));
+        assert_eq!(
+            decide_spend(TorrentCost::Ratio, 1, 0, None),
+            Ok(Spend::Ratio)
+        );
+        // Free costs are checked against MaM once the torrent file is in hand
+        for cost in [
+            TorrentCost::GlobalFreeleech,
+            TorrentCost::PersonalFreeleech,
+            TorrentCost::Vip,
+        ] {
+            assert!(!needs_lookup(cost, 1, 0));
+            assert_eq!(decide_spend(cost, 1, 0, None), Ok(Spend::Nothing));
+        }
+    }
+
+    #[test]
+    fn test_lookup_agrees_with_spend() {
+        // Without a lookup, decide_spend must not take the torrent to be missing on MaM, which
+        // would drop the selection
+        for cost in [
+            TorrentCost::GlobalFreeleech,
+            TorrentCost::PersonalFreeleech,
+            TorrentCost::Vip,
+            TorrentCost::UseWedge,
+            TorrentCost::TryWedge,
+            TorrentCost::Ratio,
+        ] {
+            for (wedges, wedge_buffer) in [(0, 0), (1, 0), (2, 2), (3, 2)] {
+                if !needs_lookup(cost, wedges, wedge_buffer) {
+                    assert_ne!(
+                        decide_spend(cost, wedges, wedge_buffer, None),
+                        Err(NotGrabbed::NotOnMam),
+                        "{cost:?}, {wedges} wedges, buffer {wedge_buffer}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_drops_selection() {
+        assert!(drops_selection(&anyhow::Error::new(StaleDlLink)));
+        assert!(drops_selection(&anyhow::Error::new(NotGrabbed::NotOnMam)));
+        assert!(drops_selection(&anyhow::Error::new(
+            NotGrabbed::AlreadySnatched
+        )));
+        // Wedges can come back, so that's tried again
+        assert!(!drops_selection(&anyhow::Error::new(
+            NotGrabbed::FewerWedges {
+                wedges: 0,
+                wedge_buffer: 0
+            }
+        )));
+        assert!(!drops_selection(&anyhow::anyhow!("Could not add torrent")));
     }
 }
