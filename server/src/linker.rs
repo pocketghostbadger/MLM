@@ -9,16 +9,22 @@ use std::{
     ops::Deref,
     path::{Component, Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use file_id::get_file_id;
 use log::error;
 use mlm_db::{
-    ClientStatus, DatabaseExt as _, ErroredTorrentId, Event, EventType, LibraryMismatch,
-    SelectedTorrent, SelectedTorrentKey, Size, Timestamp, Torrent, TorrentKey, TorrentMeta,
+    ClientStatus, DatabaseExt as _, ErroredTorrent, ErroredTorrentId, Event, EventType,
+    LibraryMismatch, SelectedTorrent, SelectedTorrentKey, Size, Timestamp, Torrent, TorrentKey,
+    TorrentMeta,
 };
-use mlm_mam::{api::MaM, meta::MetaError, search::MaMTorrent};
+use mlm_mam::{
+    api::{AccountBlockedError, MaM, RateLimitError},
+    meta::MetaError,
+    search::MaMTorrent,
+};
 use mlm_parse::normalize_title;
 use native_db::Database;
 use once_cell::sync::Lazy;
@@ -27,12 +33,14 @@ use qbit::{
     parameters::TorrentListParams,
 };
 use regex::Regex;
-use tokio::fs::create_dir_all;
+use reqwest::Url;
+use tokio::{fs::create_dir_all, time::sleep};
 use tracing::{Level, debug, instrument, span, trace, warn};
 
 use crate::{
     audiobookshelf::{self as abs},
     autograbber::update_torrent_meta,
+    backoff::Backoff,
     cleaner::remove_library_files,
     config::{Config, Library, LibraryLinkMethod, QbitConfig},
     logging::{TorrentMetaError, update_errored_torrent, write_event},
@@ -41,6 +49,21 @@ use crate::{
 
 pub static DISK_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?:CD|Disc|Disk)\s*(\d+)").unwrap());
+
+const MAM_DOMAIN: &str = "myanonamouse.net";
+
+/// Torrents that failed to link after a MaM lookup wait 30 minutes before the next try, then twice
+/// as long each time, up to a day, so the lookup isn't repeated on every run. Keyed by info hash
+static LINK_BACKOFF: tokio::sync::Mutex<Backoff<String>> =
+    tokio::sync::Mutex::const_new(Backoff::new(
+        Duration::from_secs(30 * 60),
+        Duration::from_secs(24 * 60 * 60),
+    ));
+
+/// Ends every wait after failed links, for a linker run started by hand
+pub async fn retry_failed_links() {
+    LINK_BACKOFF.lock().await.clear();
+}
 
 #[instrument(skip_all)]
 pub async fn link_torrents_to_library(
@@ -55,6 +78,9 @@ pub async fn link_torrents_to_library(
         .await
         .context("qbit main data")?;
 
+    // Set when MaM rate limits a lookup or blocks the account. The rest of the run makes no more
+    // lookups, but still does everything else
+    let mut mam_refused = false;
     for torrent in torrents {
         if torrent.progress < 1.0 {
             continue;
@@ -196,6 +222,55 @@ pub async fn link_torrents_to_library(
             continue;
         }
 
+        if LINK_BACKOFF
+            .lock()
+            .await
+            .waiting(&torrent.hash, Instant::now())
+        {
+            trace!(
+                "Waiting before linking torrent \"{}\" again after it failed",
+                torrent.name
+            );
+            continue;
+        }
+
+        // Torrents MLM doesn't know yet could be from other trackers, whose hashes MaM
+        // shouldn't be asked about
+        if existing_torrent.is_none() {
+            match qbit.1.trackers(&torrent.hash).await {
+                Ok(trackers) if !trackers.iter().any(|t| is_mam_tracker(&t.url)) => {
+                    trace!("Skipping torrent \"{}\", it isn't from MaM", torrent.name);
+                    // An error from before such torrents were skipped wouldn't clear otherwise
+                    let error_id = ErroredTorrentId::Linker(torrent.hash.clone());
+                    if db
+                        .r_transaction()?
+                        .get()
+                        .primary::<ErroredTorrent>(error_id.clone())?
+                        .is_some()
+                    {
+                        update_errored_torrent(&db, error_id, torrent.name, Ok(())).await;
+                    }
+                    continue;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    update_errored_torrent(
+                        &db,
+                        ErroredTorrentId::Linker(torrent.hash.clone()),
+                        torrent.name,
+                        Err(anyhow::Error::new(err).context("qbit trackers")),
+                    )
+                    .await;
+                    continue;
+                }
+            }
+        }
+
+        if mam_refused {
+            continue;
+        }
+
+        let mut looked_up = false;
         let result = match_torrent(
             config.clone(),
             db.clone(),
@@ -205,9 +280,18 @@ pub async fn link_torrents_to_library(
             &torrent,
             library,
             existing_torrent,
+            &mut looked_up,
         )
         .await
         .context("match_torrent");
+        // Failures before the lookup didn't ask MaM anything, so they're tried again next run
+        if looked_up {
+            LINK_BACKOFF
+                .lock()
+                .await
+                .record(&torrent.hash, result.is_ok(), Instant::now());
+        }
+        mam_refused = result.as_ref().err().is_some_and(stops_run);
         update_errored_torrent(
             &db,
             ErroredTorrentId::Linker(torrent.hash.clone()),
@@ -215,9 +299,34 @@ pub async fn link_torrents_to_library(
             result,
         )
         .await;
+        if looked_up && !mam_refused {
+            sleep(Duration::from_millis(400)).await;
+        }
     }
 
+    if mam_refused {
+        bail!(
+            "MaM rate limited the linker or blocked the account, other lookups wait for the next run"
+        );
+    }
     Ok(())
+}
+
+/// Whether MaM answered a lookup by rate limiting or blocking the account, so that the rest of
+/// the run shouldn't look anything else up
+fn stops_run(err: &anyhow::Error) -> bool {
+    err.is::<RateLimitError>() || err.is::<AccountBlockedError>()
+}
+
+/// Whether a tracker URL is MaM's. Only the host is looked at: tracker URLs contain the passkey,
+/// so they must not be logged or stored
+fn is_mam_tracker(url: &str) -> bool {
+    Url::parse(url).is_ok_and(|url| {
+        url.host_str().is_some_and(|host| {
+            host.strip_suffix(MAM_DOMAIN)
+                .is_some_and(|subdomain| subdomain.is_empty() || subdomain.ends_with('.'))
+        })
+    })
 }
 
 #[instrument(skip_all)]
@@ -231,6 +340,8 @@ async fn match_torrent(
     torrent: &QbitTorrent,
     library: &Library,
     existing_torrent: Option<Torrent>,
+    // Set once MaM is asked about the torrent
+    looked_up: &mut bool,
 ) -> Result<()> {
     let mut existing_torrent = existing_torrent;
     let files = qbit.1.files(hash, None).await?;
@@ -248,6 +359,7 @@ async fn match_torrent(
     if selected_audio_format.is_none() && selected_ebook_format.is_none() {
         bail!("Could not find any wanted formats in torrent");
     }
+    *looked_up = true;
     let Some(mam_torrent) = mam.get_torrent_info(hash).await.context("get_mam_info")? else {
         bail!("Could not find torrent on mam");
     };
@@ -857,6 +969,50 @@ pub fn file_size(m: &Metadata) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_mam_tracker() {
+        assert!(is_mam_tracker(
+            "https://t.myanonamouse.net/tracker.php/PASSKEY/announce"
+        ));
+        assert!(is_mam_tracker(
+            "http://T.MyAnonamouse.net:443/tracker.php/PASSKEY/announce"
+        ));
+        assert!(is_mam_tracker("https://myanonamouse.net/announce"));
+        assert!(!is_mam_tracker("https://tracker.example.org/announce"));
+        assert!(!is_mam_tracker(
+            "https://myanonamouse.net.example.org/announce"
+        ));
+        assert!(!is_mam_tracker("https://notmyanonamouse.net/announce"));
+        assert!(!is_mam_tracker(
+            "https://myanonamouse.net@tracker.example.org/announce"
+        ));
+        assert!(!is_mam_tracker(
+            "https://tracker.example.org/myanonamouse.net/announce"
+        ));
+        assert!(!is_mam_tracker("udp://tracker.example.org:6969"));
+        // qBittorrent lists DHT, PeX and LSD as trackers too
+        assert!(!is_mam_tracker("** [DHT] **"));
+        assert!(!is_mam_tracker(""));
+    }
+
+    #[test]
+    fn test_stops_run() {
+        // As match_torrent returns them, with context around the lookup's error
+        let from_lookup = |err: anyhow::Error| {
+            Err::<(), _>(err)
+                .context("get_mam_info")
+                .context("match_torrent")
+                .unwrap_err()
+        };
+        assert!(stops_run(&from_lookup(anyhow::Error::new(RateLimitError))));
+        assert!(stops_run(&from_lookup(anyhow::Error::new(
+            AccountBlockedError
+        ))));
+        assert!(!stops_run(&from_lookup(anyhow::anyhow!(
+            "Could not find torrent on mam"
+        ))));
+    }
 
     #[test]
     fn test_map_path() {

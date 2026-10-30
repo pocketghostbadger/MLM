@@ -17,6 +17,7 @@ use tokio_stream::{StreamExt as _, wrappers::WatchStream};
 
 use crate::{
     config::{Config, TorrentFilter},
+    linker::retry_failed_links,
     lists::{List, get_lists},
     stats::Context,
     web::{AppError, Page, time},
@@ -96,6 +97,8 @@ pub async fn index_page_post(
 ) -> Result<Redirect, AppError> {
     match form.action.as_str() {
         "run_linker" => {
+            // Run by hand, so torrents waiting after failed links are tried too
+            retry_failed_links().await;
             context.triggers.linker_tx.send(())?;
         }
         "run_search" => {

@@ -2,6 +2,7 @@
 
 mod audiobookshelf;
 mod autograbber;
+mod backoff;
 mod cleaner;
 mod config;
 mod config_impl;
