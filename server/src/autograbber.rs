@@ -444,6 +444,13 @@ pub async fn select_torrents<T: Iterator<Item = MaMTorrent>>(
         if cost == Cost::MetadataOnly {
             continue 'torrent;
         }
+        let Some(torrent_cost) = selection_cost(cost, &torrent) else {
+            debug!(
+                "Skipping torrent {} as it is not free, cost: {:?}",
+                torrent.id, cost
+            );
+            continue 'torrent;
+        };
         let title_search = normalize_title(&meta.title);
         let preferred_types = config.preferred_types(&meta.media_type);
         let preference = preferred_types
@@ -577,22 +584,9 @@ pub async fn select_torrents<T: Iterator<Item = MaMTorrent>>(
             .clone()
             .or_else(|| tags.iter().find_map(|t| t.category.clone()));
         let tags = tags.iter().flat_map(|t| t.tags.clone()).collect();
-        let cost = if torrent.vip {
-            TorrentCost::Vip
-        } else if torrent.personal_freeleech {
-            TorrentCost::PersonalFreeleech
-        } else if torrent.free {
-            TorrentCost::GlobalFreeleech
-        } else if cost == Cost::Wedge {
-            TorrentCost::UseWedge
-        } else if cost == Cost::TryWedge {
-            TorrentCost::TryWedge
-        } else {
-            TorrentCost::Ratio
-        };
         info!(
             "Selecting torrent \"{}\" in format {}, cost: {:?}, with category {:?} and tags {:?}",
-            torrent.title, torrent.filetype, cost, category, tags
+            torrent.title, torrent.filetype, torrent_cost, category, tags
         );
         if let Some((_, rw)) = &rw_opt {
             selected_torrents += 1;
@@ -606,7 +600,7 @@ pub async fn select_torrents<T: Iterator<Item = MaMTorrent>>(
                     .ok_or_else(|| Error::msg(format!("no dl field for torrent {}", torrent.id)))?,
                 unsat_buffer,
                 wedge_buffer,
-                cost,
+                cost: torrent_cost,
                 category,
                 tags,
                 title_search,
@@ -624,6 +618,25 @@ pub async fn select_torrents<T: Iterator<Item = MaMTorrent>>(
     }
 
     Ok(selected_torrents)
+}
+
+/// The cost a torrent is selected with, or None when its grab block's cost doesn't allow
+/// downloading it. A torrent's own flags come first, so a free torrent is stored as free whatever
+/// the block's cost
+fn selection_cost(cost: Cost, torrent: &MaMTorrent) -> Option<TorrentCost> {
+    let torrent_cost = match cost {
+        Cost::MetadataOnly | Cost::MetadataOnlyAdd => return None,
+        _ if torrent.vip => TorrentCost::Vip,
+        _ if torrent.personal_freeleech => TorrentCost::PersonalFreeleech,
+        _ if torrent.free => TorrentCost::GlobalFreeleech,
+        Cost::Wedge => TorrentCost::UseWedge,
+        Cost::TryWedge => TorrentCost::TryWedge,
+        Cost::Ratio => TorrentCost::Ratio,
+        // Free through fl_vip only, which the downloader checks the same way as VIP
+        Cost::Free if torrent.fl_vip => TorrentCost::Vip,
+        Cost::Free => return None,
+    };
+    Some(torrent_cost)
 }
 
 #[instrument(skip_all)]
@@ -832,4 +845,67 @@ fn add_duplicate_torrent(
         duplicate_of,
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_selection_cost() {
+        let plain = MaMTorrent::default();
+        let free = MaMTorrent {
+            free: true,
+            fl_vip: true,
+            ..Default::default()
+        };
+        let personal = MaMTorrent {
+            personal_freeleech: true,
+            ..Default::default()
+        };
+        let vip = MaMTorrent {
+            vip: true,
+            fl_vip: true,
+            ..Default::default()
+        };
+        let fl_vip = MaMTorrent {
+            fl_vip: true,
+            ..Default::default()
+        };
+
+        // Free torrents are stored as free, whatever the block's cost
+        for cost in [Cost::Free, Cost::Wedge, Cost::TryWedge, Cost::Ratio] {
+            assert_eq!(
+                selection_cost(cost, &free),
+                Some(TorrentCost::GlobalFreeleech)
+            );
+            assert_eq!(
+                selection_cost(cost, &personal),
+                Some(TorrentCost::PersonalFreeleech)
+            );
+            assert_eq!(selection_cost(cost, &vip), Some(TorrentCost::Vip));
+        }
+        assert_eq!(selection_cost(Cost::Free, &fl_vip), Some(TorrentCost::Vip));
+
+        // Other torrents take the block's cost, and free blocks skip them
+        assert_eq!(
+            selection_cost(Cost::Wedge, &plain),
+            Some(TorrentCost::UseWedge)
+        );
+        assert_eq!(
+            selection_cost(Cost::TryWedge, &plain),
+            Some(TorrentCost::TryWedge)
+        );
+        assert_eq!(
+            selection_cost(Cost::Ratio, &plain),
+            Some(TorrentCost::Ratio)
+        );
+        assert_eq!(selection_cost(Cost::Free, &plain), None);
+
+        // Metadata only blocks don't download anything
+        for cost in [Cost::MetadataOnly, Cost::MetadataOnlyAdd] {
+            assert_eq!(selection_cost(cost, &free), None);
+            assert_eq!(selection_cost(cost, &plain), None);
+        }
+    }
 }
