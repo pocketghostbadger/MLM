@@ -11,7 +11,7 @@ use tracing::{instrument, trace};
 
 use crate::{
     autograbber::select_torrents,
-    config::{Config, NotionList},
+    config::{Config, Cost, NotionList},
 };
 
 static IMPORT_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -74,7 +74,11 @@ pub async fn run_notion_import(
             sleep(Duration::from_millis(400)).await;
             if let Some(torrent) = mam_torrent {
                 for grab in &list.grab {
-                    if !grab.filter.matches(&torrent) {
+                    // Like Goodreads, a free block passes on a torrent that isn't free, so a
+                    // later block can take it
+                    if !grab.filter.matches(&torrent)
+                        || (grab.cost == Cost::Free && !torrent.is_free())
+                    {
                         continue;
                     }
                     let selected = select_torrents(
