@@ -19,6 +19,7 @@ use tracing::info;
 
 use crate::{
     stats::Context,
+    torrent_downloader::ratio_room,
     web::{
         AppError, Page, flag_icons,
         tables::{self, Flex, HidableColumns, Key, SortOn, Sortable},
@@ -156,10 +157,12 @@ pub async fn selected_page(
     };
 
     let remaining_buffer = user_info.as_ref().map(|user_info| {
-        Size::from_bytes(
-            ((user_info.uploaded_bytes - user_info.downloaded_bytes - downloading_size)
-                / config.min_ratio) as u64,
-        )
+        Size::from_bytes(ratio_room(
+            user_info.uploaded_bytes,
+            user_info.downloaded_bytes,
+            downloading_size,
+            config.min_ratio,
+        ) as u64)
     });
     let template = SelectedPageTemplate {
         user_info,

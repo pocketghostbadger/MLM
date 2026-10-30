@@ -57,9 +57,12 @@ pub async fn grab_selected_torrents(
         .map(|t| t.meta.size.bytes() as f64)
         .sum();
 
-    let mut remaining_buffer =
-        (user_info.uploaded_bytes - user_info.downloaded_bytes - downloading_size)
-            / config.min_ratio;
+    let mut remaining_buffer = ratio_room(
+        user_info.uploaded_bytes,
+        user_info.downloaded_bytes,
+        downloading_size,
+        config.min_ratio,
+    );
     debug!(
         "downloader, unsats: {:#?}; max_torrents: {max_torrents}; buffer: {}",
         user_info.snatch_summary.unsat,
@@ -79,6 +82,10 @@ pub async fn grab_selected_torrents(
         }
         let buffer_after = remaining_buffer - torrent.meta.size.bytes() as f64;
         if buffer_after <= 0.0 {
+            debug!(
+                "Not grabbing torrent \"{}\", not enough room above min_ratio",
+                torrent.meta.title
+            );
             continue;
         }
 
@@ -130,6 +137,12 @@ pub async fn grab_selected_torrents(
         sleep(Duration::from_millis(1000)).await;
     }
     Ok(())
+}
+
+/// How many more bytes can be downloaded before the ratio would drop below `min_ratio`,
+/// counting torrents that are still downloading as downloaded
+pub(crate) fn ratio_room(uploaded: f64, downloaded: f64, downloading: f64, min_ratio: f64) -> f64 {
+    uploaded / min_ratio - downloaded - downloading
 }
 
 #[instrument(skip_all)]
@@ -441,5 +454,34 @@ pub(crate) async fn get_mam_torrent_file(
                 Err(e) => return Err(e),
             },
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    #[test]
+    fn test_ratio_room() {
+        // The example from the docs: 100 GiB up and 40 GiB down leave 10 GiB at a ratio of 2
+        assert_eq!(ratio_room(100.0 * GIB, 40.0 * GIB, 0.0, 2.0), 10.0 * GIB);
+        // Torrents that are still downloading count as downloaded
+        assert_eq!(
+            ratio_room(100.0 * GIB, 40.0 * GIB, 4.0 * GIB, 2.0),
+            6.0 * GIB
+        );
+        // Already below min_ratio, so there's no room at all
+        assert!(ratio_room(100.0 * GIB, 60.0 * GIB, 0.0, 2.0) < 0.0);
+
+        // Using all of the room ends exactly at min_ratio, whether it's below, at or above 1
+        for min_ratio in [0.5, 1.0, 2.0] {
+            let (uploaded, downloaded, downloading) = (100.0 * GIB, 30.0 * GIB, 5.0 * GIB);
+            let room = ratio_room(uploaded, downloaded, downloading, min_ratio);
+            assert!(room > 0.0);
+            let ratio = uploaded / (downloaded + downloading + room);
+            assert!((ratio - min_ratio).abs() < 1e-9, "{min_ratio}: {ratio}");
+        }
     }
 }
