@@ -53,8 +53,9 @@ pub static DISK_PATTERN: Lazy<Regex> =
 const MAM_DOMAIN: &str = "myanonamouse.net";
 
 /// Torrents that failed to link after a MaM lookup wait 30 minutes before the next try, then twice
-/// as long each time, up to a day, so the lookup isn't repeated on every run. Keyed by info hash
-static LINK_BACKOFF: tokio::sync::Mutex<Backoff<String>> =
+/// as long each time, up to a day, so the lookup isn't repeated on every run. Keyed by qBittorrent
+/// URL and info hash, since each instance links its own copy of a torrent
+static LINK_BACKOFF: tokio::sync::Mutex<Backoff<(String, String)>> =
     tokio::sync::Mutex::const_new(Backoff::new(
         Duration::from_secs(30 * 60),
         Duration::from_secs(24 * 60 * 60),
@@ -222,10 +223,11 @@ pub async fn link_torrents_to_library(
             continue;
         }
 
+        let backoff_key = (qbit.0.url.clone(), torrent.hash.clone());
         if LINK_BACKOFF
             .lock()
             .await
-            .waiting(&torrent.hash, Instant::now())
+            .waiting(&backoff_key, Instant::now())
         {
             trace!(
                 "Waiting before linking torrent \"{}\" again after it failed",
@@ -289,7 +291,7 @@ pub async fn link_torrents_to_library(
             LINK_BACKOFF
                 .lock()
                 .await
-                .record(&torrent.hash, result.is_ok(), Instant::now());
+                .record(&backoff_key, result.is_ok(), Instant::now());
         }
         mam_refused = result.as_ref().err().is_some_and(stops_run);
         update_errored_torrent(
