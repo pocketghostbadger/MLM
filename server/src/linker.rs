@@ -21,7 +21,7 @@ use mlm_db::{
     TorrentMeta,
 };
 use mlm_mam::{
-    api::{AccountBlockedError, MaM, RateLimitError},
+    api::{MaM, RequestsPausedError, refused_or_paused},
     meta::MetaError,
     search::MaMTorrent,
 };
@@ -79,7 +79,8 @@ pub async fn link_torrents_to_library(
         .await
         .context("qbit main data")?;
 
-    // Set when MaM rate limits a lookup or blocks the account. The rest of the run makes no more
+    // Set when MaM rate limits a lookup or blocks the account, or a lookup is skipped because
+    // requests to MaM are paused after that. While paused, the rest of the run makes no more
     // lookups, but still does everything else
     let mut mam_refused = false;
     for torrent in torrents {
@@ -268,7 +269,8 @@ pub async fn link_torrents_to_library(
             }
         }
 
-        if mam_refused {
+        if mam.requests_paused().is_some() {
+            mam_refused = true;
             continue;
         }
 
@@ -286,14 +288,24 @@ pub async fn link_torrents_to_library(
         )
         .await
         .context("match_torrent");
+        // A lookup that wasn't sent because requests to MaM are paused didn't ask MaM anything
+        // either, so it isn't recorded as a failure of the torrent
+        let paused = result
+            .as_ref()
+            .err()
+            .is_some_and(|err| err.is::<RequestsPausedError>());
         // Failures before the lookup didn't ask MaM anything, so they're tried again next run
-        if looked_up {
+        if looked_up && !paused {
             LINK_BACKOFF
                 .lock()
                 .await
                 .record(&backoff_key, result.is_ok(), Instant::now());
         }
-        mam_refused = result.as_ref().err().is_some_and(stops_run);
+        let refused = result.as_ref().err().is_some_and(refused_or_paused);
+        mam_refused |= refused;
+        if paused {
+            continue;
+        }
         update_errored_torrent(
             &db,
             ErroredTorrentId::Linker(torrent.hash.clone()),
@@ -301,23 +313,18 @@ pub async fn link_torrents_to_library(
             result,
         )
         .await;
-        if looked_up && !mam_refused {
+        if looked_up && !refused {
             sleep(Duration::from_millis(400)).await;
         }
     }
 
     if mam_refused {
-        bail!(
-            "MaM rate limited the linker or blocked the account, other lookups wait for the next run"
-        );
+        match mam.requests_paused() {
+            Some(paused) => bail!("{paused}, other lookups wait for a later run"),
+            None => bail!("Requests to MaM were paused, other lookups wait for a later run"),
+        }
     }
     Ok(())
-}
-
-/// Whether MaM answered a lookup by rate limiting or blocking the account, so that the rest of
-/// the run shouldn't look anything else up
-fn stops_run(err: &anyhow::Error) -> bool {
-    err.is::<RateLimitError>() || err.is::<AccountBlockedError>()
 }
 
 /// Whether a tracker URL is MaM's. Only the host is looked at: tracker URLs contain the passkey,
@@ -970,6 +977,8 @@ pub fn file_size(m: &Metadata) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use mlm_mam::api::{AccountBlockedError, PauseReason, RateLimitError};
+
     use super::*;
 
     #[test]
@@ -999,7 +1008,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stops_run() {
+    fn test_refusals_stop_run() {
         // As match_torrent returns them, with context around the lookup's error
         let from_lookup = |err: anyhow::Error| {
             Err::<(), _>(err)
@@ -1007,11 +1016,19 @@ mod tests {
                 .context("match_torrent")
                 .unwrap_err()
         };
-        assert!(stops_run(&from_lookup(anyhow::Error::new(RateLimitError))));
-        assert!(stops_run(&from_lookup(anyhow::Error::new(
+        assert!(refused_or_paused(&from_lookup(anyhow::Error::new(
+            RateLimitError
+        ))));
+        assert!(refused_or_paused(&from_lookup(anyhow::Error::new(
             AccountBlockedError
         ))));
-        assert!(!stops_run(&from_lookup(anyhow::anyhow!(
+        let paused = from_lookup(anyhow::Error::new(RequestsPausedError {
+            reason: PauseReason::RateLimited,
+            remaining: Duration::from_secs(60),
+        }));
+        assert!(refused_or_paused(&paused));
+        assert!(paused.is::<RequestsPausedError>());
+        assert!(!refused_or_paused(&from_lookup(anyhow::anyhow!(
             "Could not find torrent on mam"
         ))));
     }

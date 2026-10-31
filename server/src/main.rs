@@ -224,6 +224,23 @@ async fn app_main() -> Result<()> {
     };
     if let Ok(mam) = &mam {
         {
+            // The dashboard reloads on stats updates. A pause on requests to MaM can start from
+            // the web UI and ends on its own, so check every 30 seconds whether it changed
+            let mam = mam.clone();
+            let stats = stats.clone();
+            tokio::spawn(async move {
+                let mut paused_until = None;
+                loop {
+                    sleep(Duration::from_secs(30)).await;
+                    let now = mam.paused_until();
+                    if now != paused_until {
+                        paused_until = now;
+                        stats.update(|_| {}).await;
+                    }
+                }
+            });
+        }
+        {
             let config = config.clone();
             let db = db.clone();
             let mam = mam.clone();

@@ -13,6 +13,11 @@
 mam_id is invalid, all features are disabled: {{ mam_error }}
 </p>
 {% endif %}
+{% if let Some((reason, until)) = mam_paused %}
+<p class=missing>
+Requests to MaM are paused until {{ self::time(until) }} after {{ reason }}. MLM sends no requests to MaM until then.
+</p>
+{% endif %}
 {% if has_no_qbits %}
 <p class=missing>
 no qbittorrent instances configured, all features are disabled

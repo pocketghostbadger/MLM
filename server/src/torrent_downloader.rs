@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use bytes::Bytes;
 use lava_torrent::torrent::v1::Torrent;
 use mlm_db::{
@@ -8,7 +8,7 @@ use mlm_db::{
     TorrentCost, TorrentKey,
 };
 use mlm_mam::{
-    api::{MaM, RateLimitError},
+    api::{MaM, RequestsPausedError, refused_or_paused},
     search::MaMTorrent,
 };
 use native_db::Database;
@@ -16,9 +16,8 @@ use qbit::{
     models::Torrent as QbitTorrent,
     parameters::{AddTorrent, AddTorrentType, TorrentFile, TorrentListParams, TorrentState},
 };
-use mlm_mam::api::AccountBlockedError;
 use tokio::time::sleep;
-use tracing::{debug, info, instrument, trace, warn};
+use tracing::{debug, info, instrument, trace};
 
 use crate::{
     config::Config,
@@ -94,11 +93,16 @@ pub async fn grab_selected_torrents(
 
         let result = grab_torrent(config, db, qbit, qbit_url, mam, torrent.clone()).await;
 
-        // if the account is temporarly blocked, mlm will still try to download new files every second
-        // resulting in a unnecessary load on the server and a prolonged penalty
-        // here it gets checked if a blocked message gets returned
-        let account_blocked = result.as_ref().err().is_some_and(|err| err.is::<AccountBlockedError>());
-                
+        // Once MaM rate limits a request or blocks the account, requests to MaM are paused, so
+        // the other selections wait for a later pass. A grab that wasn't sent because of the
+        // pause isn't recorded as an error of the torrent
+        if let Err(err) = &result
+            && err.is::<RequestsPausedError>()
+        {
+            return result;
+        }
+        let mam_refused = result.as_ref().err().is_some_and(refused_or_paused);
+
         // A stale dl link, or a torrent that can't be grabbed at its cost, can't be
         // grabbed on a later pass either, so drop the selection instead of asking the
         // site for it every run. It stays on the errors page, and restoring it from
@@ -129,9 +133,13 @@ pub async fn grab_selected_torrents(
         )
         .await;
 
-        if account_blocked {
-            warn!("Account issue (406 Not Acceptable) detected. Stopping current autograb cycle.");
-            break;
+        if mam_refused {
+            match mam.requests_paused() {
+                Some(paused) => bail!("{paused}, other grabs wait for a later pass"),
+                None => bail!(
+                    "MaM rate limited the downloader or blocked the account, other grabs wait for a later pass"
+                ),
+            }
         }
 
         sleep(Duration::from_millis(1000)).await;
@@ -500,13 +508,15 @@ async fn fetch_torrent_file(
     fresh_dl_link: Option<&str>,
 ) -> Result<(Bytes, Torrent)> {
     if let Some(dl_link) = fresh_dl_link {
-        let bytes = get_mam_torrent_file(mam, dl_link, torrent.mam_id, wedge).await?;
+        let bytes = mam.get_torrent_file(dl_link, torrent.mam_id, wedge).await?;
         let parsed =
             Torrent::read_from_bytes(bytes.clone()).map_err(|_| anyhow::Error::new(StaleDlLink))?;
         return Ok((bytes, parsed));
     }
 
-    let bytes = get_mam_torrent_file(mam, &torrent.dl_link, torrent.mam_id, wedge).await?;
+    let bytes = mam
+        .get_torrent_file(&torrent.dl_link, torrent.mam_id, wedge)
+        .await?;
     if let Ok(parsed) = Torrent::read_from_bytes(bytes.clone()) {
         return Ok((bytes, parsed));
     }
@@ -522,7 +532,9 @@ async fn fetch_torrent_file(
     }
 
     debug!("refreshing stale dl link for torrent {}", torrent.mam_id);
-    let bytes = get_mam_torrent_file(mam, &dl_link, torrent.mam_id, wedge).await?;
+    let bytes = mam
+        .get_torrent_file(&dl_link, torrent.mam_id, wedge)
+        .await?;
     let parsed =
         Torrent::read_from_bytes(bytes.clone()).map_err(|_| anyhow::Error::new(StaleDlLink))?;
 
@@ -534,38 +546,6 @@ async fn fetch_torrent_file(
     rw.commit()?;
 
     Ok((bytes, parsed))
-}
-
-/// How many times to retry a single download after being rate limited before
-/// giving up on it. Retrying forever means one torrent can keep requesting for
-/// as long as the process runs.
-const MAX_RATE_LIMIT_RETRIES: u32 = 3;
-
-pub(crate) async fn get_mam_torrent_file(
-    mam: &MaM<'_>,
-    dl_hash: &str,
-    tid: u64,
-    wedge: bool,
-) -> Result<Bytes> {
-    let mut attempts = 0;
-    loop {
-        let result = mam.get_torrent_file(dl_hash, tid, wedge).await;
-
-        match result {
-            Ok(v) => return Ok(v),
-            Err(e) => match e.downcast::<RateLimitError>() {
-                Ok(rate_limit) => {
-                    attempts += 1;
-                    if attempts > MAX_RATE_LIMIT_RETRIES {
-                        warn!("Giving up on torrent {tid} after {attempts} rate limited requests");
-                        return Err(anyhow::Error::new(rate_limit));
-                    }
-                    sleep(Duration::from_millis(30_000)).await;
-                }
-                Err(e) => return Err(e),
-            },
-        };
-    }
 }
 
 #[cfg(test)]
