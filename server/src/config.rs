@@ -5,10 +5,10 @@ use mlm_db::{
     impls::{parse, parse_opt, parse_vec},
 };
 use mlm_mam::{
-    enums::{Categories, SearchIn, SnatchlistType},
+    enums::{Categories, SearchIn},
     serde::parse_opt_date,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::IgnoredAny};
 use time::Date;
 
 #[derive(Debug, Deserialize)]
@@ -54,8 +54,9 @@ pub struct Config {
     #[serde(default)]
     #[serde(rename = "autograb")]
     pub autograbs: Vec<TorrentSearch>,
+    /// Snatchlist was removed, entries are only read to warn about them
     #[serde(default)]
-    pub snatchlist: Vec<SnatchlistSearch>,
+    pub snatchlist: Vec<IgnoredAny>,
 
     #[serde(default)]
     #[serde(rename = "goodreads_list")]
@@ -135,22 +136,6 @@ pub enum SortBy {
     LowSnatches,
     OldestFirst,
     Random,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SnatchlistSearch {
-    #[serde(rename = "type")]
-    pub kind: SnatchlistType,
-    #[serde(default)]
-    pub cost: Cost,
-    pub max_pages: Option<u8>,
-    #[serde(flatten)]
-    pub filter: TorrentFilter,
-
-    pub search_interval: Option<u64>,
-    #[serde(default)]
-    pub dry_run: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]

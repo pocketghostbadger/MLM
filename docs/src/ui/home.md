@@ -12,7 +12,6 @@ At the top you are greeted by name. If something is wrong that stops MLM from wo
 Each job has its own box showing **Last run** (the time, or "never") and **Result** (*success*, an error message, or *running* while it is busy). Most boxes have a **run now** button.
 
 - **Autograbber** – one box for each autograbber in your configuration. It searches MyAnonamouse for new torrents that match your wishes and selects them for download.
-- **Snatchlist Grabber** – one box for each snatchlist entry in your configuration. It picks up torrents you have already snatched on MyAnonamouse.
 - **Goodreads Import** – one box for each Goodreads list in your configuration. It reads the list and looks for the books on it.
 - **Linker** – places finished downloads in your library folders with tidy names and structure.
 - **Cleaner** – removes older versions from your library when a better one arrives. It has no button, because it runs by itself after the linker.
