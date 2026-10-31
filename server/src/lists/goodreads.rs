@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,6 +19,7 @@ use tracing::{debug, instrument, trace, warn};
 
 use crate::{
     autograbber::select_torrents,
+    backoff::Backoff,
     config::{Config, Cost, GoodreadsList, Grab},
     lists::{search_grabs, search_library},
 };
@@ -27,45 +27,13 @@ use crate::{
 pub static SERIES_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(.*?) \(([^)]*?),? #?(\d+(?:\.\d+)?)\)$").unwrap());
 
-static IMPORT_MUTEX: tokio::sync::Mutex<Backoff> = tokio::sync::Mutex::const_new(Backoff::new());
-
-/// The first and longest wait before searching again for a book that wasn't found
-const BACKOFF_FIRST_WAIT: Duration = Duration::from_secs(2 * 60 * 60);
-const BACKOFF_MAX_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// Books whose searches keep finding nothing are searched less often: each such search doubles
-/// the wait before the next one, from 2 hours up to a day. This is only kept in memory, so after a
-/// restart every book is searched again
-struct Backoff {
-    misses: BTreeMap<(String, String), (u32, Instant)>,
-}
-
-impl Backoff {
-    const fn new() -> Self {
-        Self {
-            misses: BTreeMap::new(),
-        }
-    }
-
-    /// Whether a list item is still waiting after searches that found nothing
-    fn waiting(&self, guid: &(String, String), now: Instant) -> bool {
-        self.misses
-            .get(guid)
-            .is_some_and(|(_, retry_at)| now < *retry_at)
-    }
-
-    /// Records whether a search for a list item found anything
-    fn record(&mut self, guid: &(String, String), found: bool, now: Instant) {
-        if found {
-            self.misses.remove(guid);
-            return;
-        }
-        let misses = self.misses.get(guid).map_or(0, |(misses, _)| *misses) + 1;
-        let wait = BACKOFF_FIRST_WAIT * 2u32.pow(misses.min(5) - 1);
-        self.misses
-            .insert(guid.clone(), (misses, now + wait.min(BACKOFF_MAX_WAIT)));
-    }
-}
+/// Books whose searches keep finding nothing wait 2 hours before the next search, then twice as
+/// long each time, up to a day. Keyed by list item guid
+static IMPORT_MUTEX: tokio::sync::Mutex<Backoff<(String, String)>> =
+    tokio::sync::Mutex::const_new(Backoff::new(
+        Duration::from_secs(2 * 60 * 60),
+        Duration::from_secs(24 * 60 * 60),
+    ));
 
 #[instrument(skip_all)]
 pub async fn run_goodreads_import(
@@ -199,7 +167,7 @@ async fn search_item(
     item: &Item,
     mut db_item: ListItem,
     max_torrents: u64,
-    backoff: &mut Backoff,
+    backoff: &mut Backoff<(String, String)>,
 ) -> Result<u64> {
     if !db_item.want_audio() && !db_item.want_ebook() {
         return Ok(0);
@@ -964,41 +932,6 @@ mod tests {
             select(&torrents, OldMainCat::Ebook),
             (Some((2, Cost::Ratio)), None)
         );
-    }
-
-    #[test]
-    fn test_backoff() {
-        let mut backoff = Backoff::new();
-        let book = ("list".to_owned(), "book".to_owned());
-        let other = ("list".to_owned(), "other".to_owned());
-        let start = Instant::now();
-        let hours = |h: u64| start + Duration::from_secs(h * 60 * 60);
-        assert!(!backoff.waiting(&book, start));
-
-        // Hourly runs: each search that finds nothing doubles the wait, 2, 4, 8, 16 hours
-        let mut searched_at = vec![];
-        for h in 0..=30 {
-            if !backoff.waiting(&book, hours(h)) {
-                backoff.record(&book, false, hours(h));
-                searched_at.push(h);
-            }
-        }
-        assert_eq!(searched_at, vec![0, 2, 6, 14, 30]);
-        assert!(!backoff.waiting(&other, hours(30)));
-
-        // Then a day at most
-        assert!(backoff.waiting(&book, hours(53)));
-        assert!(!backoff.waiting(&book, hours(54)));
-        backoff.record(&book, false, hours(54));
-        assert!(backoff.waiting(&book, hours(77)));
-        assert!(!backoff.waiting(&book, hours(78)));
-
-        // Finding something ends the wait and starts over
-        backoff.record(&book, true, hours(78));
-        assert!(!backoff.waiting(&book, hours(78)));
-        backoff.record(&book, false, hours(79));
-        assert!(backoff.waiting(&book, hours(80)));
-        assert!(!backoff.waiting(&book, hours(81)));
     }
 
     /// Fetches a real shelf through the widget, run with
