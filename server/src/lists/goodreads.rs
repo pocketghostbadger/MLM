@@ -53,7 +53,7 @@ pub async fn run_goodreads_import(
 
     if rss.channel.items.is_empty() {
         warn!(
-            "Goodreads list {list_id} has no books, check that the shelf exists and the profile is public"
+            "Goodreads list {list_id} has no books, check that the shelf name is right"
         );
         return Ok(());
     }
@@ -104,12 +104,17 @@ pub async fn run_goodreads_import(
                     || db_item.allow_ebook != list.allow_ebook()
                     || db_item.title != item.title
                     || db_item.series.first() != item.series.as_ref()
+                    || (db_item.book_url.is_none() && item.book_url.is_some())
                 {
                     db_item.prefer_format = list.prefer_format;
                     db_item.allow_audio = list.allow_audio();
                     db_item.allow_ebook = list.allow_ebook();
                     db_item.title = item.title.clone();
                     db_item.series = item.series.iter().cloned().collect();
+                    // Books stored without a link get the one from the widget
+                    if db_item.book_url.is_none() {
+                        db_item.book_url = item.book_url.clone();
+                    }
                     if !list.dry_run {
                         let (_guard, rw) = db.rw_async().await?;
                         rw.upsert(db_item.clone())?;
@@ -353,11 +358,11 @@ fn widget_url(list_url: &str, widget_id: &str) -> Result<Option<String>> {
         .query_pairs()
         .find(|(name, _)| name == "shelf")
         .map(|(_, shelf)| shelf.into_owned())
-        .filter(|shelf| !shelf.is_empty())
+        .filter(|shelf| !shelf.is_empty() && !shelf.eq_ignore_ascii_case("#ALL#"))
     else {
-        // The widget returns no books for #ALL#
+        // Without a shelf the widget returns the read shelf, and it returns no books for #ALL#
         bail!(
-            "Goodreads list url {list_url} has no shelf, add one like &shelf=to-read (all books is no longer supported)"
+            "Goodreads list url {list_url} needs a single shelf, such as shelf=to-read (importing all books is no longer supported)"
         );
     };
 
@@ -476,7 +481,11 @@ fn parse_widget(content: &str, list_id: &str) -> Result<Rss> {
             author_name,
             series: None,
             book_large_image_url: cover,
-            book_url: book_id.map(|id| format!("https://www.goodreads.com/book/show/{id}")),
+            // Without a cover there's no book id, use the review page the widget links to instead
+            book_url: Some(match book_id {
+                Some(id) => format!("https://www.goodreads.com/book/show/{id}"),
+                None => format!("https://www.goodreads.com/review/show/{review_id}"),
+            }),
             isbn: None,
             description: String::new(),
         });
@@ -759,6 +768,13 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            widget_url(
+                "https://www.goodreads.com/review/list/12345678-jane-doe?shelf=%23ALL%23",
+                "mlm1"
+            )
+            .is_err()
+        );
         // Anything else is still read as RSS
         assert_eq!(
             widget_url("https://www.goodreads.com/group/bookshelf/1.rss", "mlm1").unwrap(),
@@ -799,7 +815,10 @@ mod tests {
         assert_eq!(item.title, "Don't Look Back & Other Stories");
         assert_eq!(item.author_name.as_deref(), Some("A.B. Writer"));
         assert_eq!(item.book_id, None);
-        assert_eq!(item.book_url, None);
+        assert_eq!(
+            item.book_url.as_deref(),
+            Some("https://www.goodreads.com/review/show/123")
+        );
     }
 
     #[test]
@@ -934,7 +953,7 @@ mod tests {
         );
     }
 
-    /// Fetches a real shelf through the widget, run with
+    /// Fetches a real shelf and another shelf of the same user through the widget, run with
     /// GOODREADS_RSS_URL=... cargo test -p mlm live_widget -- --ignored --nocapture
     #[tokio::test]
     #[ignore]
@@ -949,12 +968,32 @@ mod tests {
             wedge_buffer: None,
             dry_run: true,
         };
-        let list_id = list.list_id().unwrap();
-        let shelf = list_id.split_once(':').unwrap().1.to_owned();
-        // Two fetches in a row must both return the shelf from the url, not a cached one,
-        // parse_widget fails if the widget is for another shelf
-        for _ in 0..2 {
-            let rss = fetch_list(&list).await.unwrap();
+        let shelf = list.list_id().unwrap().split_once(':').unwrap().1.to_owned();
+        // Another shelf of the same user. It doesn't need to exist: the widget names the
+        // requested shelf even when it has no books
+        let other_shelf = if shelf == "read" { "to-read" } else { "read" };
+        let mut other_url: reqwest::Url = list.url.parse().unwrap();
+        let pairs: Vec<(String, String)> = other_url
+            .query_pairs()
+            .map(|(name, value)| {
+                let value = if name == "shelf" {
+                    other_shelf.to_owned()
+                } else {
+                    value.into_owned()
+                };
+                (name.into_owned(), value)
+            })
+            .collect();
+        other_url.query_pairs_mut().clear().extend_pairs(pairs);
+        let other = GoodreadsList {
+            url: other_url.to_string(),
+            ..list.clone()
+        };
+        // Switching shelves of the same user must return each requested shelf, not a cached
+        // render of the previous one. parse_widget fails if the widget is for another shelf
+        for list in [&list, &other, &list] {
+            let list_id = list.list_id().unwrap();
+            let rss = fetch_list(list).await.unwrap();
             println!(
                 "{list_id}: {} ({} items)",
                 rss.channel.title,
@@ -966,8 +1005,11 @@ mod tests {
                     item.guid, item.title, item.author_name, item.book_id
                 );
             }
-            assert!(rss.channel.title.ends_with(&format!(": {shelf}")));
-            assert!(!rss.channel.items.is_empty());
+            let list_shelf = list_id.split_once(':').unwrap().1;
+            assert!(rss.channel.title.ends_with(&format!(": {list_shelf}")));
+            if list_shelf == shelf {
+                assert!(!rss.channel.items.is_empty());
+            }
             sleep(Duration::from_millis(1100)).await;
         }
     }
