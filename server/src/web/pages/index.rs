@@ -13,6 +13,7 @@ use axum_extra::extract::Form;
 use futures::Stream;
 use mlm_db::Timestamp;
 use serde::Deserialize;
+use time::OffsetDateTime;
 use tokio_stream::{StreamExt as _, wrappers::WatchStream};
 
 use crate::{
@@ -31,11 +32,21 @@ pub async fn index_page(
         Ok(mam) => mam.cached_user_info().await.map(|u| u.username),
         Err(_) => None,
     };
+    let mam_paused = match context.mam.as_ref() {
+        Ok(mam) => mam.requests_paused().map(|paused| {
+            (
+                paused.reason.to_string(),
+                Timestamp::from(OffsetDateTime::now_utc() + paused.remaining),
+            )
+        }),
+        Err(_) => None,
+    };
     let config = context.config.lock().await;
     let template = IndexPageTemplate {
         config: config.clone(),
         lists: get_lists(&config),
         mam_error: context.mam.as_ref().as_ref().err().map(|e| format!("{e}")),
+        mam_paused,
         has_no_qbits: config.qbittorrent.is_empty(),
         username,
         autograbber_run_at: stats
@@ -143,6 +154,8 @@ struct IndexPageTemplate {
     config: Arc<Config>,
     lists: Vec<List>,
     mam_error: Option<String>,
+    /// Why requests to MaM are paused, and until when
+    mam_paused: Option<(String, Timestamp)>,
     has_no_qbits: bool,
     username: Option<String>,
     autograbber_run_at: BTreeMap<usize, Timestamp>,

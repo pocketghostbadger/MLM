@@ -34,7 +34,6 @@ use crate::{
     audiobookshelf::{self as abs, Abs},
     config::{Config, Cost, SortBy, TorrentFilter, TorrentSearch, Type},
     logging::write_event,
-    torrent_downloader::get_mam_torrent_file,
 };
 
 static AUTOGRABBER_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -823,7 +822,7 @@ async fn update_selected_torrent_meta(
 }
 
 pub async fn get_mam_torrent_hash(mam: &MaM<'_>, dl_hash: &str, tid: u64) -> Result<String> {
-    let torrent_file_bytes = get_mam_torrent_file(mam, dl_hash, tid, false).await?;
+    let torrent_file_bytes = mam.get_torrent_file(dl_hash, tid, false).await?;
     let torrent_file = Torrent::read_from_bytes(torrent_file_bytes.clone())?;
     let hash = torrent_file.info_hash();
     Ok(hash)
