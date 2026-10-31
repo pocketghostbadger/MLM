@@ -6,8 +6,9 @@ The URL has to name a single `shelf`. MLM can't import all of a user's books, so
 work either.
 
 Goodreads stopped serving the bookshelf RSS feeds in October 2026. MLM now reads a user's shelf through Goodreads'
-public bookshelf widget instead. The RSS feeds of group bookshelves returned 404 in testing too, so those can't be
-imported anymore. The widget differs from the RSS feeds in a few ways:
+public bookshelf widget instead. Goodreads no longer serves the RSS feeds of group bookshelves either, so MLM rejects
+group bookshelf URLs (`/group/bookshelf/...`) with an error and those lists can't be imported anymore. The widget
+differs from the RSS feeds in a few ways:
 - The widget doesn't use the RSS `key` and needs no sign-in. In testing (October 2026) it still returned the shelves
   of profiles set to "Goodreads members" or "just my friends", so private profiles keep working. Be aware that this
   also means anyone can read your shelves through the widget, whatever your profile privacy setting. Goodreads may
