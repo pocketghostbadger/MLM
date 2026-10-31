@@ -324,11 +324,17 @@ async fn fetch_list(list: &GoodreadsList) -> Result<Rss> {
     Ok(from_reader(&content[..])?)
 }
 
-/// Maps a Goodreads shelf RSS or shelf page url to the equivalent custom widget url
+/// Maps a Goodreads shelf RSS or shelf page url to the equivalent custom widget url,
+/// fails for group bookshelves
 fn widget_url(list_url: &str, widget_id: &str) -> Result<Option<String>> {
     let link: reqwest::Url = list_url.parse()?;
     if !matches!(link.host_str(), Some("www.goodreads.com" | "goodreads.com")) {
         return Ok(None);
+    }
+    if link.path().starts_with("/group/bookshelf/") {
+        bail!(
+            "Goodreads list url {list_url} is a group bookshelf, Goodreads no longer offers feeds for group bookshelves so they can't be imported"
+        );
     }
     let Some(user) = link
         .path()
@@ -739,11 +745,19 @@ mod tests {
             )
             .is_err()
         );
-        // Anything else is still read as RSS
-        assert_eq!(
-            widget_url("https://www.goodreads.com/group/bookshelf/1.rss", "mlm1").unwrap(),
-            None
+        // Goodreads no longer serves group bookshelf feeds
+        let err = widget_url("https://www.goodreads.com/group/bookshelf/1.rss", "mlm1")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("group bookshelf"), "{err}");
+        assert!(
+            widget_url(
+                "https://goodreads.com/group/bookshelf/1-example-group?shelf=to-read",
+                "mlm1"
+            )
+            .is_err()
         );
+        // Anything else is still read as RSS
         assert_eq!(
             widget_url("https://example.com/review/list/1?shelf=read", "mlm1").unwrap(),
             None
