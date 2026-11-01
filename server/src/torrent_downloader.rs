@@ -172,8 +172,6 @@ pub enum NotGrabbed {
     FewerWedges { wedges: u64, wedge_buffer: u64 },
     #[error("Could not get torrent from MaM")]
     NotOnMam,
-    #[error("Torrent was already snatched, so no wedge is used on it")]
-    AlreadySnatched,
     #[error("Torrent was already snatched, so it isn't downloaded again")]
     SkippedSnatched,
     #[error("Torrent is no longer free, expected: {0:?}")]
@@ -213,8 +211,9 @@ fn needs_lookup(cost: TorrentCost, wedges: u64, wedge_buffer: u64, skip_snatched
 ///
 /// With `skip_snatched`, a torrent the account already snatched isn't grabbed at all. A selection
 /// that was free when it was picked is only grabbed while it's still free. No wedge is used on a
-/// torrent that's already free or VIP, or on one that was already snatched, which is probably in
-/// a client already.
+/// torrent that's already free or VIP. A try_wedge selection made by hand downloads a torrent the
+/// account already snatched on ratio, since it's probably in a client already, while a wedge
+/// selection made by hand, picked with "Download with Wedge", uses the wedge.
 fn decide_spend(
     cost: TorrentCost,
     wedges: u64,
@@ -244,7 +243,9 @@ fn decide_spend(
                 match info {
                     None => NotGrabbed::NotOnMam,
                     Some(info) if wedge_not_needed(info) => return Ok(Spend::Nothing),
-                    Some(info) if info.my_snatched => NotGrabbed::AlreadySnatched,
+                    Some(info) if info.my_snatched && cost == TorrentCost::TryWedge => {
+                        return Ok(Spend::Ratio);
+                    }
                     Some(_) => return Ok(Spend::Wedge),
                 }
             };
@@ -337,11 +338,9 @@ async fn grab_torrent(
             );
             (spend == Spend::Wedge, None)
         }
-        Err(
-            err @ (NotGrabbed::AlreadySnatched
-            | NotGrabbed::SkippedSnatched
-            | NotGrabbed::NoLongerFree(_)),
-        ) => (false, Some(err)),
+        Err(err @ (NotGrabbed::SkippedSnatched | NotGrabbed::NoLongerFree(_))) => {
+            (false, Some(err))
+        }
         Err(err) => return Err(err.into()),
     };
     if will_wedge {
@@ -927,19 +926,30 @@ mod tests {
             );
         }
 
-        // By hand, no wedge either on a torrent that was already snatched, or that MaM doesn't
-        // return, or when wedges run out. wedge isn't grabbed then, try_wedge falls back to ratio
+        // By hand, a wedge picked with "Download with Wedge" is used on a torrent the account
+        // already snatched. try_wedge downloads it on ratio instead, as it's probably in a
+        // client already
         let wedge = |wedges, wedge_buffer, info| {
             decide_spend(TorrentCost::UseWedge, wedges, wedge_buffer, false, info)
         };
         let try_wedge = |wedges, wedge_buffer, info| {
             decide_spend(TorrentCost::TryWedge, wedges, wedge_buffer, false, info)
         };
-        assert_eq!(
-            wedge(1, 0, Some(&snatched)),
-            Err(NotGrabbed::AlreadySnatched)
-        );
+        assert_eq!(wedge(1, 0, Some(&snatched)), Ok(Spend::Wedge));
+        assert_eq!(wedge(3, 2, Some(&snatched)), Ok(Spend::Wedge));
         assert_eq!(try_wedge(1, 0, Some(&snatched)), Ok(Spend::Ratio));
+        // Neither uses a wedge on one that's VIP now
+        let vip_snatched = MaMTorrent {
+            vip: true,
+            fl_vip: true,
+            my_snatched: true,
+            ..Default::default()
+        };
+        assert_eq!(wedge(1, 0, Some(&vip_snatched)), Ok(Spend::Nothing));
+        assert_eq!(try_wedge(1, 0, Some(&vip_snatched)), Ok(Spend::Nothing));
+
+        // By hand, no wedge on a torrent that MaM doesn't return, or when wedges run out. wedge
+        // isn't grabbed then, try_wedge falls back to ratio
         assert_eq!(wedge(1, 0, None), Err(NotGrabbed::NotOnMam));
         assert_eq!(try_wedge(1, 0, None), Ok(Spend::Ratio));
         assert_eq!(
@@ -1108,9 +1118,6 @@ mod tests {
     fn test_drops_selection() {
         assert!(drops_selection(&anyhow::Error::new(StaleDlLink)));
         assert!(drops_selection(&anyhow::Error::new(NotGrabbed::NotOnMam)));
-        assert!(drops_selection(&anyhow::Error::new(
-            NotGrabbed::AlreadySnatched
-        )));
         assert!(drops_selection(&anyhow::Error::new(
             NotGrabbed::NoLongerFree(TorrentCost::GlobalFreeleech)
         )));
