@@ -199,6 +199,14 @@
       <span class=key>ebook_types</span> = {{ self::yaml_items(ebook_types) }}<br>
       {% endif %}
     {% endif %}
+    {% if library.tag_filters().link_to_audiobooks %}
+    <span class=key>link_to_audiobooks</span> = <span class=num>{{ library.tag_filters().link_to_audiobooks }}</span><br>
+    <span class=key>link_to_audiobooks_types</span> = {{ self::yaml_items(library.tag_filters().link_to_audiobooks_types) }}<br>
+    <span class=key>link_to_audiobooks_existing</span> = <span class=num>{{ library.tag_filters().link_to_audiobooks_existing }}</span><br>
+    {% endif %}
+    {% if !library.tag_filters().link_to_audiobooks_deny_tags.is_empty() %}
+    <span class=key>link_to_audiobooks_deny_tags</span> = {{ self::yaml_items(library.tag_filters().link_to_audiobooks_deny_tags) }}<br>
+    {% endif %}
   </div>
 </div>
 {% endfor %}

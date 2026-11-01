@@ -1,6 +1,6 @@
-use std::{fs, io::ErrorKind, ops::Deref, sync::Arc};
+use std::{fs, io::ErrorKind, ops::Deref, sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
 use mlm_db::{
     self, DatabaseExt as _, ErroredTorrentId, Event, EventType, Timestamp, Torrent, TorrentKey,
 };
@@ -10,6 +10,7 @@ use tracing::{debug, info, instrument, trace, warn};
 use crate::{
     audiobookshelf::Abs,
     config::Config,
+    ebook_links::{self, LinksGuard, remove_ebook_links},
     linker::file_size,
     logging::{TorrentMetaError, update_errored_torrent, write_event},
     qbittorrent::ensure_category_exists,
@@ -134,34 +135,23 @@ pub async fn clean_torrent(
     mut remove: Torrent,
     delete_in_abs: bool,
 ) -> Result<()> {
+    // Held until the record says the files are gone, so ebooks aren't linked back in meanwhile
+    let links = ebook_links::lock().await;
+    // Before changing anything in qBittorrent, so a linked ebook that can't be removed stops the
+    // clean first
+    if !remove_ebook_links(db, config, &remove.id, &links).await? {
+        bail!("Could not remove an ebook linked into an audiobook folder, see the log");
+    }
     if remove.id_is_hash {
-        for qbit_conf in config.qbittorrent.iter() {
-            if let Some(on_cleaned) = &qbit_conf.on_cleaned {
-                let qbit = qbit::Api::new_login_username_password(
-                    &qbit_conf.url,
-                    &qbit_conf.username,
-                    &qbit_conf.password,
-                )
-                .await?;
-
-                if let Some(category) = &on_cleaned.category {
-                    ensure_category_exists(&qbit, &qbit_conf.url, category).await?;
-                    qbit.set_category(Some(vec![&remove.id]), category).await?;
-                }
-
-                if !on_cleaned.tags.is_empty() {
-                    qbit.add_tags(
-                        Some(vec![&remove.id]),
-                        on_cleaned.tags.iter().map(Deref::deref).collect(),
-                    )
-                    .await?;
-                }
-            }
-            trace!("qbit updated");
-        }
+        // The ebook-links lock is held, so a qBittorrent that doesn't answer mustn't hold up the
+        // others for long
+        tokio::time::timeout(Duration::from_secs(30), apply_on_cleaned(config, &remove.id))
+            .await
+            .unwrap_or_else(|_| Err(anyhow!("timed out updating qBittorrent")))?;
     }
 
-    remove_library_files(config, &remove, delete_in_abs).await?;
+    remove_library_files(config, db, &remove, &links).await?;
+    let abs_book = remove.clone();
 
     let id = remove.id.clone();
     let mam_id = remove.meta.mam_id;
@@ -174,6 +164,11 @@ pub async fn clean_torrent(
         let (_guard, rw) = db.rw_async().await?;
         rw.upsert(remove)?;
         rw.commit()?;
+    }
+    drop(links);
+    // After the files are gone, so a clean that fails leaves the book in Audiobookshelf
+    if delete_in_abs {
+        delete_from_abs(config, &abs_book).await;
     }
 
     if let Some(library_path) = library_path {
@@ -194,19 +189,60 @@ pub async fn clean_torrent(
     Ok(())
 }
 
+/// Sets each qBittorrent instance's on_cleaned category and tags on the torrent
+async fn apply_on_cleaned(config: &Config, id: &str) -> Result<()> {
+    for qbit_conf in config.qbittorrent.iter() {
+        if let Some(on_cleaned) = &qbit_conf.on_cleaned {
+            let qbit = qbit::Api::new_login_username_password(
+                &qbit_conf.url,
+                &qbit_conf.username,
+                &qbit_conf.password,
+            )
+            .await?;
+
+            if let Some(category) = &on_cleaned.category {
+                ensure_category_exists(&qbit, &qbit_conf.url, category).await?;
+                qbit.set_category(Some(vec![id]), category).await?;
+            }
+
+            if !on_cleaned.tags.is_empty() {
+                qbit.add_tags(
+                    Some(vec![id]),
+                    on_cleaned.tags.iter().map(Deref::deref).collect(),
+                )
+                .await?;
+            }
+        }
+        trace!("qbit updated");
+    }
+    Ok(())
+}
+
+pub async fn delete_from_abs(config: &Config, remove: &Torrent) {
+    if let (Some(abs_id), Some(abs_config)) = (&remove.abs_id, &config.audiobookshelf) {
+        // A relink holds the ebook-links lock during this, so it mustn't wait for long
+        let result = match Abs::new(abs_config) {
+            Ok(abs) => tokio::time::timeout(Duration::from_secs(30), abs.delete_book(abs_id))
+                .await
+                .unwrap_or_else(|_| Err(anyhow!("timed out"))),
+            Err(err) => Err(err),
+        };
+        if let Err(err) = result {
+            warn!("Failed deleting book from abs: {err}");
+        }
+    }
+}
+
 #[instrument(skip_all)]
 pub async fn remove_library_files(
     config: &Config,
+    db: &Database<'_>,
     remove: &Torrent,
-    delete_in_abs: bool,
+    links: &LinksGuard,
 ) -> Result<()> {
-    if delete_in_abs
-        && let (Some(abs_id), Some(abs_config)) = (&remove.abs_id, &config.audiobookshelf)
-    {
-        let abs = Abs::new(abs_config)?;
-        if let Err(err) = abs.delete_book(abs_id).await {
-            warn!("Failed deleting book from abs: {err}");
-        }
+    // First, so an audiobook's folder can be removed once its own files are gone
+    if !remove_ebook_links(db, config, &remove.id, links).await? {
+        bail!("Could not remove an ebook linked into an audiobook folder, see the log");
     }
 
     if let Some(library_path) = &remove.library_path {
