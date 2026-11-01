@@ -544,7 +544,10 @@ fn file_state(config: &Config, link: &EbookLink) -> FileState {
         }
         Err(_) => FileState::Unknown,
         Ok(meta) if meta.file_type().is_symlink() => {
-            if fs::read_link(&path).is_ok_and(|target| target == link.source) {
+            // symlink links to the absolute path
+            if fs::read_link(&path).is_ok_and(|target| {
+                std::path::absolute(&link.source).is_ok_and(|source| source == target)
+            }) {
                 FileState::Linked
             } else {
                 FileState::Other
@@ -916,9 +919,10 @@ fn copy_new(source: &Path, path: &Path) -> io::Result<()> {
     })
 }
 
+/// A symlink's target is read from the folder it's in, so a relative library_dir is made absolute
 fn symlink(source: &Path, path: &Path) -> io::Result<()> {
     #[cfg(target_family = "unix")]
-    return std::os::unix::fs::symlink(source, path);
+    return std::os::unix::fs::symlink(std::path::absolute(source)?, path);
     #[cfg(not(target_family = "unix"))]
     {
         let _ = (source, path);
@@ -1554,6 +1558,40 @@ link_to_audiobooks_deny_tags = [\"no-ebook-link\"]",
         pair(&config, &db, Some(&tagged(&ebook.id))).await.unwrap();
         assert!(!epub.exists());
         assert!(links(&db).is_empty());
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn test_symlink_from_a_relative_library_dir() {
+        let dir = TestDir::new();
+        // Relative to the working directory, as a relative library_dir is
+        let relative = TestDir(PathBuf::from(format!("mlm-test-{}", uuid::Uuid::new_v4())));
+        fs::create_dir(&relative.0).unwrap();
+        let source = relative.0.join("Dune.epub");
+        fs::write(&source, "ebook").unwrap();
+        let path = dir.0.join("Dune.epub");
+
+        let linked = link_file(LibraryLinkMethod::Symlink, &source, &path);
+        let target = fs::read_link(&path);
+        let content = fs::read_to_string(&path);
+        let config = config(&dir.0, "");
+        let state = file_state(
+            &config,
+            &EbookLink {
+                audiobook_id: "a".to_owned(),
+                ebook_id: "e".to_owned(),
+                path: path.clone(),
+                source: source.clone(),
+                file_id: None,
+                created_at: Timestamp::now(),
+            },
+        );
+        drop(relative);
+
+        linked.unwrap();
+        assert!(target.unwrap().is_absolute());
+        assert_eq!(content.unwrap(), "ebook");
+        assert!(matches!(state, FileState::Linked));
     }
 
     #[cfg(target_family = "unix")]
