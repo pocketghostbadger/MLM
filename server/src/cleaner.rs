@@ -1,4 +1,4 @@
-use std::{fs, io::ErrorKind, mem, ops::Deref, sync::Arc};
+use std::{fs, io::ErrorKind, ops::Deref, sync::Arc};
 
 use anyhow::Result;
 use mlm_db::{
@@ -26,20 +26,36 @@ pub async fn run_library_cleaner(config: Arc<Config>, db: Arc<Database<'_>>) -> 
             .filter(|t| t.library_path.is_some())
             .collect()
     };
-    let mut batch: Vec<Torrent> = vec![];
-    for torrent in torrents {
-        if let Some(current) = batch.first() {
-            if !current.matches(&torrent) {
-                process_batch(&config, &db, mem::take(&mut batch)).await?;
-            }
-            batch.push(torrent);
-        } else {
-            batch.push(torrent);
-        }
+    for batch in batches(torrents) {
+        process_batch(&config, &db, batch).await?;
     }
-    process_batch(&config, &db, batch).await?;
 
     Ok(())
+}
+
+/// Groups copies of the same book. The torrents come sorted by title_search, and each one joins
+/// the first group of its title in which it matches every torrent, so copies of a book are grouped
+/// even when other editions, media types, languages or narrators of the same title sort between
+/// them, and the copy that's kept matches every copy that's removed
+fn batches(torrents: Vec<Torrent>) -> Vec<Vec<Torrent>> {
+    let mut batches: Vec<Vec<Torrent>> = vec![];
+    let mut title_start = 0;
+    for torrent in torrents {
+        if batches
+            .get(title_start)
+            .is_some_and(|batch| batch[0].title_search != torrent.title_search)
+        {
+            title_start = batches.len();
+        }
+        match batches[title_start..]
+            .iter_mut()
+            .find(|batch| batch.iter().all(|t| t.matches(&torrent)))
+        {
+            Some(batch) => batch.push(torrent),
+            None => batches.push(vec![torrent]),
+        }
+    }
+    batches
 }
 
 #[instrument(skip_all)]
@@ -234,4 +250,114 @@ pub async fn remove_library_files(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use mlm_db::{MediaType, MetadataSource, Size, TorrentMeta};
+
+    use super::*;
+
+    fn torrent(id: &str, title_search: &str, edition: Option<u64>) -> Torrent {
+        Torrent {
+            id: id.to_owned(),
+            id_is_hash: false,
+            mam_id: 0,
+            abs_id: None,
+            goodreads_id: None,
+            library_path: None,
+            library_files: vec![],
+            linker: None,
+            category: None,
+            selected_audio_format: None,
+            selected_ebook_format: None,
+            title_search: title_search.to_owned(),
+            meta: TorrentMeta {
+                mam_id: 0,
+                vip_status: None,
+                cat: None,
+                media_type: MediaType::Audiobook,
+                main_cat: None,
+                categories: vec![],
+                language: None,
+                flags: None,
+                filetypes: vec![],
+                num_files: 0,
+                size: Size::from_bytes(0),
+                title: title_search.to_owned(),
+                edition: edition.map(|n| (format!("Edition {n}"), n)),
+                authors: vec!["Author".to_owned()],
+                narrators: vec![],
+                series: vec![],
+                source: MetadataSource::Mam,
+                uploaded_at: Timestamp::now(),
+            },
+            created_at: Timestamp::now(),
+            replaced_with: None,
+            request_matadata_update: false,
+            library_mismatch: None,
+            client_status: None,
+        }
+    }
+
+    fn ids(batches: &[Vec<Torrent>]) -> Vec<Vec<&str>> {
+        batches
+            .iter()
+            .map(|batch| batch.iter().map(|t| t.id.as_str()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn test_batches_keep_editions_apart() {
+        let batches = batches(vec![
+            torrent("a", "book", Some(2)),
+            torrent("b", "book", Some(3)),
+        ]);
+        assert_eq!(ids(&batches), vec![vec!["a"], vec!["b"]]);
+    }
+
+    #[test]
+    fn test_batches_group_interleaved_copies() {
+        let batches = batches(vec![
+            torrent("a", "book", Some(2)),
+            torrent("b", "book", Some(3)),
+            torrent("c", "book", Some(2)),
+            torrent("d", "book", Some(3)),
+        ]);
+        assert_eq!(ids(&batches), vec![vec!["a", "c"], vec!["b", "d"]]);
+    }
+
+    #[test]
+    fn test_batches_group_copies_around_other_media_types() {
+        let mut ebook = torrent("b", "book", None);
+        ebook.meta.media_type = MediaType::Ebook;
+        let batches = batches(vec![
+            torrent("a", "book", None),
+            ebook,
+            torrent("c", "book", None),
+        ]);
+        assert_eq!(ids(&batches), vec![vec!["a", "c"], vec!["b"]]);
+    }
+
+    #[test]
+    fn test_batches_need_every_copy_to_match() {
+        let mut a = torrent("a", "book", None);
+        a.meta.narrators = vec!["N1".to_owned(), "N2".to_owned()];
+        let mut b = torrent("b", "book", None);
+        b.meta.narrators = vec!["N1".to_owned()];
+        let mut c = torrent("c", "book", None);
+        c.meta.narrators = vec!["N2".to_owned()];
+        let batches = batches(vec![a, b, c]);
+        assert_eq!(ids(&batches), vec![vec!["a", "b"], vec!["c"]]);
+    }
+
+    #[test]
+    fn test_batches_split_titles() {
+        let batches = batches(vec![
+            torrent("a", "book", None),
+            torrent("b", "book", None),
+            torrent("c", "other", None),
+        ]);
+        assert_eq!(ids(&batches), vec![vec!["a", "b"], vec!["c"]]);
+    }
 }

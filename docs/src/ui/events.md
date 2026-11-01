@@ -11,7 +11,7 @@ Events is the history of what MLM has done. The newest events are at the top, ea
 
 - **Grabbed** – MLM selected a torrent for download. It tells you how it was paid for (ratio, freeleech, VIP or a wedge) and which autograbber found it.
 - **Linked** – MLM placed a torrent in your library. It shows the destination folder, and a **Files** section lists the files.
-- **Cleaned** – MLM removed an older version from your library, usually because a preferred format arrived. It shows what was removed and, if there is one, what replaced it.
+- **Cleaned** – MLM removed a torrent's files from your library, because the cleaner kept another copy of the book, or because you cleaned or replaced it by hand. It shows what was removed and, if there is one, what replaced it.
 - **Updated** – the information about a torrent changed on MyAnonamouse. Each changed field is shown as *old → new*.
 - **Removed from MaM** – the torrent no longer exists on MyAnonamouse.
 

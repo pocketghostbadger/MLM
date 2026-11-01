@@ -14,7 +14,7 @@ Each job has its own box showing **Last run** (the time, or "never") and **Resul
 - **Autograbber** – one box for each autograbber in your configuration. It searches MyAnonamouse for new torrents that match your wishes and selects them for download.
 - **Goodreads Import** – one box for each Goodreads list in your configuration. It reads the list and looks for the books on it.
 - **Linker** – places finished downloads in your library folders with tidy names and structure.
-- **Cleaner** – removes older versions from your library when a better one arrives. It has no button, because it runs by itself after the linker.
+- **Cleaner** – removes extra copies of a book from your library, keeping the one in the format you prefer, or the larger one. It has no button, because it runs by itself after the linker.
 - **Torrent downloader** – sends the selected torrents to your torrent client.
 - **Audiobookshelf Matcher** – matches your torrents with the books in Audiobookshelf.
 
