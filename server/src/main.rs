@@ -11,7 +11,6 @@ mod linker;
 mod lists;
 mod logging;
 mod qbittorrent;
-mod snatchlist;
 mod stats;
 mod torrent_downloader;
 mod web;
@@ -48,7 +47,7 @@ use tokio::{
     time::sleep,
 };
 use torrent_downloader::grab_selected_torrents;
-use tracing::error;
+use tracing::{error, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{
     EnvFilter, Layer as _, fmt::time::LocalTime, layer::SubscriberExt as _,
@@ -60,7 +59,6 @@ use crate::{
     config::Config,
     linker::link_torrents_to_library,
     lists::{get_lists, run_list_import},
-    snatchlist::run_snatchlist_search,
     stats::Context,
 };
 
@@ -190,6 +188,12 @@ async fn app_main() -> Result<()> {
         return Ok(());
     }
     let config = config?;
+    if !config.snatchlist.is_empty() {
+        warn!(
+            "Ignoring the snatchlist entries in the config ({}): snatchlist was removed because it used a MaM endpoint that isn't in MaM's API documentation",
+            config.snatchlist.len()
+        );
+    }
     let config = Arc::new(config);
 
     let db = native_db::Builder::new().create(&mlm_db::MODELS, database_file)?;
@@ -362,75 +366,6 @@ async fn app_main() -> Result<()> {
                     .context("autograbbers");
                     if let Err(err) = &result {
                         error!("Error running autograbbers: {err:?}");
-                    }
-                    {
-                        stats
-                            .update(|stats| {
-                                stats.autograbber_result.insert(i, result);
-                            })
-                            .await;
-                    }
-                }
-            });
-        }
-
-        for (i, grab) in config.snatchlist.iter().enumerate() {
-            let i = i + config.autograbs.len();
-            let config = config.clone();
-            let db = db.clone();
-            let mam = mam.clone();
-            let (tx, mut rx) = watch::channel(());
-            search_tx.insert(i, tx);
-            search_rx.insert(i, rx.clone());
-            let stats = stats.clone();
-            let grab = Arc::new(grab.clone());
-            tokio::spawn(async move {
-                loop {
-                    let interval = grab.search_interval.unwrap_or(config.search_interval);
-                    if interval > 0 {
-                        select! {
-                            () = sleep(Duration::from_secs(60 * interval)) => {},
-                            result = rx.changed() => {
-                                if let Err(err) = result {
-                                    error!("Error listening on search_rx for snatchlist: {err:?}");
-                                    stats.update(|stats| {
-                                        stats.autograbber_result.insert(i, Err(err.into()));
-                                    }).await;
-                                }
-                            },
-                        }
-                    } else {
-                        let result = rx.changed().await;
-                        if let Err(err) = result {
-                            error!("Error listening on search_rx for snatchlist: {err:?}");
-                            stats
-                                .update(|stats| {
-                                    stats.autograbber_result.insert(i, Err(err.into()));
-                                })
-                                .await;
-                        }
-                    }
-                    {
-                        stats
-                            .update(|stats| {
-                                stats
-                                    .autograbber_run_at
-                                    .insert(i, OffsetDateTime::now_utc());
-                                stats.autograbber_result.remove(&i);
-                            })
-                            .await;
-                    }
-                    let result = run_snatchlist_search(
-                        config.clone(),
-                        db.clone(),
-                        mam.clone(),
-                        i,
-                        grab.clone(),
-                    )
-                    .await
-                    .context("snatchlist_search");
-                    if let Err(err) = &result {
-                        error!("Error running snatchlist_search: {err:?}");
                     }
                     {
                         stats

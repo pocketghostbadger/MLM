@@ -4,4 +4,3 @@ pub mod meta;
 pub mod search;
 pub mod serde;
 pub mod user_data;
-pub mod user_torrent;

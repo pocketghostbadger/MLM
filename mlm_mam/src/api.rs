@@ -4,23 +4,20 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use anyhow::{Error, Result, bail};
+use anyhow::{Error, Result};
 use bytes::Bytes;
 use cookie::Cookie;
 use mlm_db::DatabaseExt as _;
 use native_db::Database;
 use reqwest::Url;
 use reqwest_cookie_store::CookieStoreRwLock;
-use time::{OffsetDateTime, UtcDateTime};
+use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
-    // config::{Config, SnatchlistType},
-    enums::SnatchlistType,
     search::{MaMTorrent, SearchError, SearchFields, SearchQuery, SearchResult, Tor},
     user_data::UserResponse,
-    user_torrent::UserDetailsTorrentResponse,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -238,34 +235,6 @@ impl<'a> MaM<'a> {
         Ok(resp)
     }
 
-    pub async fn check_mam_id(&self) -> Result<()> {
-        let resp = self
-            .send(
-                self.client
-                    .get("https://www.myanonamouse.net/json/checkCookie.php"),
-            )
-            .await?;
-
-        let status = resp.status();
-        let text = resp.text().await?;
-        info!("checked mam_id: {text:?}");
-
-        if status.is_client_error() || status.is_server_error() {
-            bail!("Bad status for checkCookie: {}", status)
-        }
-
-        // Check if the body contains "Success":true
-        if !text.contains("\"Success\":true") {
-            bail!(
-                "Session check failed (Success: false in response): {}",
-                text
-            )
-        }
-
-        self.store_cookies().await;
-        Ok(())
-    }
-
     pub async fn user_info(&self) -> Result<UserResponse> {
         let mut cache = self.user.lock().await;
         if let Some((at, user_info)) = cache.as_ref()
@@ -382,37 +351,6 @@ impl<'a> MaM<'a> {
         for t in &mut resp.data {
             t.fix();
         }
-        self.store_cookies().await;
-        Ok(resp)
-    }
-
-    pub async fn snatchlist(
-        &self,
-        kind: SnatchlistType,
-        page: u64,
-        timestamp: UtcDateTime,
-    ) -> Result<UserDetailsTorrentResponse> {
-        debug!("snatchlist: {:?} {}", kind, page);
-        let user = self.user_info().await?;
-        let resp = self
-            .send(
-                self.client
-                    .get("https://cdn.myanonamouse.net/json/loadUserDetailsTorrents.php")
-                    .query(&(
-                        ("uid", user.uid.to_string()),
-                        ("iteration", page.to_string()),
-                        ("type", kind.to_string()),
-                        ("cacheTime", timestamp.unix_timestamp().to_string()),
-                    )),
-            )
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
-        let resp: UserDetailsTorrentResponse = serde_json::from_str(&resp).map_err(|err| {
-            error!("Error parsing mam response: {err}\nResponse: {resp}");
-            err
-        })?;
         self.store_cookies().await;
         Ok(resp)
     }
@@ -646,18 +584,12 @@ mod tests {
         assert_eq!(mam.paused_until(), Some(start + 30 * MINUTE));
 
         let paused = |result: Result<()>| result.unwrap_err().is::<RequestsPausedError>();
-        assert!(paused(mam.check_mam_id().await));
         assert!(paused(mam.user_info().await.map(|_| ())));
         assert!(paused(
             mam.get_torrent_file("abc123", 1, true).await.map(|_| ())
         ));
         assert!(paused(
             mam.search(&SearchQuery::default()).await.map(|_| ())
-        ));
-        assert!(paused(
-            mam.snatchlist(SnatchlistType::Unsat, 0, UtcDateTime::now())
-                .await
-                .map(|_| ())
         ));
     }
 

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, ensure};
 use mlm_db::{Flags, Language, MediaType, OldCategory, Size, Torrent, TorrentMeta};
-use mlm_mam::{search::MaMTorrent, serde::DATE_TIME_FORMAT, user_torrent::UserDetailsTorrent};
+use mlm_mam::{search::MaMTorrent, serde::DATE_TIME_FORMAT};
 use reqwest::Url;
 use time::UtcDateTime;
 use tracing::error;
@@ -104,74 +104,6 @@ impl TorrentFilter {
                     return false;
                 }
             }
-        }
-
-        if let Some(min_seeders) = self.min_seeders {
-            if torrent.seeders < min_seeders {
-                return false;
-            }
-        }
-        if let Some(max_seeders) = self.max_seeders {
-            if torrent.seeders > max_seeders {
-                return false;
-            }
-        }
-        if let Some(min_leechers) = self.min_leechers {
-            if torrent.leechers < min_leechers {
-                return false;
-            }
-        }
-        if let Some(max_leechers) = self.max_leechers {
-            if torrent.leechers > max_leechers {
-                return false;
-            }
-        }
-        if let Some(min_snatched) = self.min_snatched {
-            if torrent.times_completed < min_snatched {
-                return false;
-            }
-        }
-        if let Some(max_snatched) = self.max_snatched {
-            if torrent.times_completed > max_snatched {
-                return false;
-            }
-        }
-
-        true
-    }
-
-    pub fn matches_user(&self, torrent: &UserDetailsTorrent) -> bool {
-        if !self.categories.matches(torrent.category) {
-            return false;
-        }
-
-        let torrent_flags = Flags::from_bitfield(torrent.browse_flags);
-        if !self.flags.matches(&torrent_flags) {
-            return false;
-        }
-
-        if self.min_size.bytes() > 0 || self.max_size.bytes() > 0 {
-            match Size::try_from(torrent.size.clone()) {
-                Ok(size) => {
-                    if self.min_size.bytes() > 0 && size < self.min_size {
-                        return false;
-                    }
-                    if self.max_size.bytes() > 0 && size > self.max_size {
-                        return false;
-                    }
-                }
-                Err(_) => {
-                    error!(
-                        "Failed parsing size \"{}\" for torrent \"{}\"",
-                        torrent.size, torrent.title
-                    );
-                    return false;
-                }
-            };
-        }
-
-        if self.exclude_uploader.contains(&torrent.uploader_name) {
-            return false;
         }
 
         if let Some(min_seeders) = self.min_seeders {
@@ -383,6 +315,33 @@ mod tests {
     use mlm_mam::enums::Categories;
 
     use super::*;
+
+    #[test]
+    fn test_config_still_loads_with_snatchlist_entries() {
+        use figment::{
+            Figment,
+            providers::{Format, Toml},
+        };
+
+        // Loaded the same way as in main
+        let config: Config = Figment::new()
+            .merge(Toml::string(
+                r#"
+                mam_id = "test"
+
+                [[snatchlist]]
+                type = "unsat"
+                cost = "metadata_only_add"
+                max_pages = 5
+
+                [[snatchlist]]
+                type = "uploads_active"
+                "#,
+            ))
+            .extract()
+            .unwrap();
+        assert_eq!(config.snatchlist.len(), 2);
+    }
 
     #[test]
     fn test_uploaded_after() {
