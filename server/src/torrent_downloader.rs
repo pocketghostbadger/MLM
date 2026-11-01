@@ -11,7 +11,7 @@ use mlm_mam::{
     api::{MaM, RequestsPausedError, refused_or_paused},
     search::MaMTorrent,
 };
-use native_db::Database;
+use native_db::{Database, transaction::RwTransaction};
 use qbit::{
     models::Torrent as QbitTorrent,
     parameters::{AddTorrent, AddTorrentType, TorrentFile, TorrentListParams, TorrentState},
@@ -341,26 +341,29 @@ async fn grab_torrent(
 
         if is_completed {
             if rw.get().primary::<mlm_db::Torrent>(hash.clone())?.is_none() {
-                rw.upsert(mlm_db::Torrent {
-                    id: hash.clone(),
-                    id_is_hash: true,
-                    mam_id: torrent.meta.mam_id,
-                    abs_id: None,
-                    goodreads_id: torrent.goodreads_id,
-                    library_path: None,
-                    library_files: Default::default(),
-                    linker: None,
-                    category: torrent.category.clone(),
-                    selected_audio_format: None,
-                    selected_ebook_format: None,
-                    title_search: torrent.title_search.clone(),
-                    meta: torrent.meta.clone(),
-                    created_at: Timestamp::now(),
-                    replaced_with: None,
-                    request_matadata_update: false,
-                    library_mismatch: None,
-                    client_status: None,
-                })?;
+                upsert_hash_record(
+                    &rw,
+                    mlm_db::Torrent {
+                        id: hash.clone(),
+                        id_is_hash: true,
+                        mam_id: torrent.meta.mam_id,
+                        abs_id: None,
+                        goodreads_id: torrent.goodreads_id,
+                        library_path: None,
+                        library_files: Default::default(),
+                        linker: None,
+                        category: torrent.category.clone(),
+                        selected_audio_format: None,
+                        selected_ebook_format: None,
+                        title_search: torrent.title_search.clone(),
+                        meta: torrent.meta.clone(),
+                        created_at: Timestamp::now(),
+                        replaced_with: None,
+                        request_matadata_update: false,
+                        library_mismatch: None,
+                        client_status: None,
+                    },
+                )?;
             }
             rw.remove(torrent)?;
         } else {
@@ -415,26 +418,29 @@ async fn grab_torrent(
     let event = (!will_wedge).then(|| grabbed_event(hash.clone(), &torrent, false));
     {
         let (_guard, rw) = db.rw_async().await?;
-        rw.upsert(mlm_db::Torrent {
-            id: hash.clone(),
-            id_is_hash: true,
-            mam_id: torrent.meta.mam_id,
-            abs_id: None,
-            goodreads_id: torrent.goodreads_id,
-            library_path: None,
-            library_files: Default::default(),
-            linker: None,
-            category: torrent.category.clone(),
-            selected_audio_format: None,
-            selected_ebook_format: None,
-            title_search: torrent.title_search.clone(),
-            meta: torrent.meta.clone(),
-            created_at: Timestamp::now(),
-            replaced_with: None,
-            request_matadata_update: false,
-            library_mismatch: None,
-            client_status: None,
-        })?;
+        upsert_hash_record(
+            &rw,
+            mlm_db::Torrent {
+                id: hash.clone(),
+                id_is_hash: true,
+                mam_id: torrent.meta.mam_id,
+                abs_id: None,
+                goodreads_id: torrent.goodreads_id,
+                library_path: None,
+                library_files: Default::default(),
+                linker: None,
+                category: torrent.category.clone(),
+                selected_audio_format: None,
+                selected_ebook_format: None,
+                title_search: torrent.title_search.clone(),
+                meta: torrent.meta.clone(),
+                created_at: Timestamp::now(),
+                replaced_with: None,
+                request_matadata_update: false,
+                library_mismatch: None,
+                client_status: None,
+            },
+        )?;
         let mut torrent = torrent;
         torrent.hash = Some(hash.clone());
         torrent.started_at = Some(Timestamp::now());
@@ -446,6 +452,24 @@ async fn grab_torrent(
         write_event(db, event).await;
     }
 
+    Ok(())
+}
+
+/// Stores a torrent's record under its hash. A metadata only record of the same torrent, such as
+/// the one stored for a torrent the account had already snatched, is replaced
+fn upsert_hash_record(rw: &RwTransaction<'_>, mut record: mlm_db::Torrent) -> Result<()> {
+    if let Some(other) = rw
+        .get()
+        .secondary::<mlm_db::Torrent>(TorrentKey::mam_id, record.mam_id)?
+        && !other.id_is_hash
+        && other.library_path.is_none()
+    {
+        record.abs_id = record.abs_id.or(other.abs_id.clone());
+        record.goodreads_id = record.goodreads_id.or(other.goodreads_id);
+        record.replaced_with = record.replaced_with.or(other.replaced_with.clone());
+        rw.remove(other)?;
+    }
+    rw.upsert(record)?;
     Ok(())
 }
 
@@ -574,6 +598,103 @@ mod tests {
             let ratio = uploaded / (downloaded + downloading + room);
             assert!((ratio - min_ratio).abs() < 1e-9, "{min_ratio}: {ratio}");
         }
+    }
+
+    #[tokio::test]
+    async fn test_hash_record_replaces_metadata_only_record() {
+        let database = || {
+            native_db::Builder::new()
+                .create_in_memory(&mlm_db::MODELS)
+                .unwrap()
+        };
+        let stored = |db: &Database<'_>| -> Vec<mlm_db::Torrent> {
+            db.r_transaction()
+                .unwrap()
+                .scan()
+                .primary()
+                .unwrap()
+                .all()
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let put = |db: &Database<'_>, record: mlm_db::Torrent| {
+            let rw = db.rw_transaction().unwrap();
+            rw.upsert(record).unwrap();
+            rw.commit().unwrap();
+        };
+        let store_by_hash = |db: &Database<'_>, record: mlm_db::Torrent| -> Result<()> {
+            let rw = db.rw_transaction()?;
+            upsert_hash_record(&rw, record)?;
+            rw.commit()?;
+            Ok(())
+        };
+
+        let torrent = MaMTorrent {
+            id: 1,
+            title: "Book".to_owned(),
+            author_info: [(1, "Ann Author".to_owned())].into(),
+            added: "2025-01-01 00:00:00".to_owned(),
+            main_cat: 13,
+            category: mlm_db::AudiobookCategory::GeneralFiction.to_id() as u64,
+            language: mlm_db::Language::English.to_id(),
+            filetype: "m4b".to_owned(),
+            numfiles: 1,
+            size: "100 MiB".to_owned(),
+            ..Default::default()
+        };
+        let meta = torrent.as_meta().unwrap();
+        // A metadata only record, as stored for a torrent the account had already snatched
+        let scratch = database();
+        crate::autograbber::add_metadata_only_torrent(
+            scratch.rw_async().await.unwrap(),
+            torrent,
+            meta,
+            false,
+        )
+        .await
+        .unwrap();
+        let mut metadata_only = stored(&scratch).pop().unwrap();
+        metadata_only.goodreads_id = Some(5);
+        let by_hash = mlm_db::Torrent {
+            id: "hash".to_owned(),
+            id_is_hash: true,
+            goodreads_id: None,
+            ..metadata_only.clone()
+        };
+
+        // It's replaced, and its Goodreads id kept
+        let db = database();
+        put(&db, metadata_only.clone());
+        store_by_hash(&db, by_hash.clone()).unwrap();
+        let records = stored(&db);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "hash");
+        assert_eq!(records[0].goodreads_id, Some(5));
+
+        // A record under another hash is kept, even without files, so storing still fails
+        let db = database();
+        put(
+            &db,
+            mlm_db::Torrent {
+                id: "other".to_owned(),
+                ..by_hash.clone()
+            },
+        );
+        assert!(store_by_hash(&db, by_hash.clone()).is_err());
+        assert_eq!(stored(&db)[0].id, "other");
+
+        // So is a metadata only record with files
+        let db = database();
+        put(
+            &db,
+            mlm_db::Torrent {
+                library_path: Some("/library/Book".into()),
+                ..metadata_only
+            },
+        );
+        assert!(store_by_hash(&db, by_hash).is_err());
+        assert!(stored(&db)[0].library_path.is_some());
     }
 
     /// A torrent as MaM returns it: plain, free, personal freeleech, VIP, snatched, and free

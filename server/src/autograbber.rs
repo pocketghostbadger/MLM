@@ -119,7 +119,7 @@ pub async fn search_and_select_torrents(
     fields: SearchFields,
     mam: &MaM<'_>,
     max_torrents: u64,
-) -> Result<u64> {
+) -> Result<Selection> {
     let torrents = search_torrents(torrent_search, fields, mam)
         .await
         .context("search_torrents")?;
@@ -337,6 +337,15 @@ pub async fn mark_removed_torrents(
     Ok(())
 }
 
+/// What `select_torrents` did with the torrents it was given
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    /// Torrents selected for download
+    pub selected: u64,
+    /// Torrents skipped because the account already snatched them
+    pub snatched: u64,
+}
+
 #[instrument(skip_all)]
 #[allow(clippy::too_many_arguments)]
 pub async fn select_torrents<T: Iterator<Item = MaMTorrent>>(
@@ -352,8 +361,9 @@ pub async fn select_torrents<T: Iterator<Item = MaMTorrent>>(
     dry_run: bool,
     max_torrents: u64,
     goodreads_id: Option<u64>,
-) -> Result<u64> {
+) -> Result<Selection> {
     let mut selected_torrents = 0;
+    let mut snatched_torrents = 0;
     'torrent: for torrent in torrents {
         if config.ignore_torrents.contains(&torrent.id) {
             trace!("Torrent {} is ignored", torrent.id);
@@ -427,7 +437,8 @@ pub async fn select_torrents<T: Iterator<Item = MaMTorrent>>(
         }
         if cost == Cost::MetadataOnlyAdd {
             let mam_id = meta.mam_id;
-            add_metadata_only_torrent(rw_opt.unwrap(), torrent, meta)
+            info!("Adding metadata only torrent \"{}\"", meta.title);
+            add_metadata_only_torrent(rw_opt.unwrap(), torrent, meta, true)
                 .await
                 .or_else(|err| {
                     let err = err.downcast::<db_type::Error>()?;
@@ -460,6 +471,21 @@ pub async fn select_torrents<T: Iterator<Item = MaMTorrent>>(
                 "Could not find any wanted formats in torrent {}, formats: {:?}, wanted: {:?}",
                 meta.mam_id, meta.filetypes, preferred_types
             );
+            continue 'torrent;
+        }
+        // The account snatched it outside MLM, or its record was deleted. It's stored like a
+        // metadata only torrent, so list imports don't look it up again and other uploads of the
+        // same book are compared against it. It's checked before the selected uploads of the same
+        // book, so it doesn't unselect any of them
+        if torrent.my_snatched {
+            info!(
+                "Skipping torrent \"{}\" in format {} as it was already snatched, storing it without files",
+                torrent.title, torrent.filetype
+            );
+            snatched_torrents += 1;
+            if let Some(rw) = rw_opt {
+                add_metadata_only_torrent(rw, torrent, meta, false).await?;
+            }
             continue 'torrent;
         }
         if let Some((_, rw)) = &rw_opt {
@@ -616,7 +642,10 @@ pub async fn select_torrents<T: Iterator<Item = MaMTorrent>>(
         }
     }
 
-    Ok(selected_torrents)
+    Ok(Selection {
+        selected: selected_torrents,
+        snatched: snatched_torrents,
+    })
 }
 
 /// The cost a torrent is selected with, or None when its grab block's cost doesn't allow
@@ -638,13 +667,14 @@ fn selection_cost(cost: Cost, torrent: &MaMTorrent) -> Option<TorrentCost> {
     Some(torrent_cost)
 }
 
+/// Stores a torrent without files. With `linker_is_owner`, its uploader is stored as its linker
 #[instrument(skip_all)]
 pub async fn add_metadata_only_torrent(
     (_guard, rw): (MutexGuard<'_, ()>, RwTransaction<'_>),
     torrent: MaMTorrent,
     meta: TorrentMeta,
+    linker_is_owner: bool,
 ) -> Result<()> {
-    info!("Adding metadata only torrent \"{}\"", meta.title);
     let id = Uuid::new_v4().to_string();
 
     let mam_id = torrent.id;
@@ -657,7 +687,7 @@ pub async fn add_metadata_only_torrent(
             goodreads_id: None,
             library_path: None,
             library_files: Default::default(),
-            linker: if torrent.owner_name.is_empty() {
+            linker: if !linker_is_owner || torrent.owner_name.is_empty() {
                 None
             } else {
                 Some(torrent.owner_name)
@@ -848,7 +878,183 @@ fn add_duplicate_torrent(
 
 #[cfg(test)]
 mod tests {
+    use mlm_db::{AudiobookCategory, Language};
+
     use super::*;
+
+    fn config() -> Config {
+        toml::from_str("mam_id = \"test\"").unwrap()
+    }
+
+    fn database() -> Arc<Database<'static>> {
+        Arc::new(
+            native_db::Builder::new()
+                .create_in_memory(&mlm_db::MODELS)
+                .unwrap(),
+        )
+    }
+
+    fn audiobook(id: u64, title: &str, filetype: &str, my_snatched: bool) -> MaMTorrent {
+        MaMTorrent {
+            id,
+            title: title.to_owned(),
+            author_info: [(1, "Ann Author".to_owned())].into(),
+            added: "2025-01-01 00:00:00".to_owned(),
+            main_cat: 13,
+            category: AudiobookCategory::GeneralFiction.to_id() as u64,
+            language: Language::English.to_id(),
+            filetype: filetype.to_owned(),
+            numfiles: 1,
+            size: "100 MiB".to_owned(),
+            dl: Some(format!("dl{id}")),
+            my_snatched,
+            ..Default::default()
+        }
+    }
+
+    async fn select(
+        db: &Arc<Database<'static>>,
+        torrents: Vec<MaMTorrent>,
+        cost: Cost,
+        dry_run: bool,
+    ) -> Selection {
+        let mam = MaM::offline(db.clone());
+        select_torrents(
+            &config(),
+            db,
+            &mam,
+            torrents.into_iter(),
+            &TorrentFilter::default(),
+            cost,
+            None,
+            None,
+            None,
+            dry_run,
+            u64::MAX,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn selected(db: &Database<'_>, id: u64) -> Option<SelectedTorrent> {
+        db.r_transaction().unwrap().get().primary(id).unwrap()
+    }
+
+    fn stored(db: &Database<'_>, id: u64) -> Option<mlm_db::Torrent> {
+        db.r_transaction()
+            .unwrap()
+            .get()
+            .secondary(TorrentKey::mam_id, id)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_skips_snatched_torrents() {
+        let db = database();
+        let selection = select(
+            &db,
+            vec![
+                audiobook(1, "Snatched Book", "m4b", true),
+                audiobook(2, "Other Book", "m4b", false),
+            ],
+            Cost::Ratio,
+            false,
+        )
+        .await;
+        assert_eq!(
+            selection,
+            Selection {
+                selected: 1,
+                snatched: 1
+            }
+        );
+        assert!(selected(&db, 1).is_none());
+        assert!(selected(&db, 2).is_some());
+
+        // The snatched torrent is stored without files, so it's skipped as already stored from now
+        // on
+        let snatched = stored(&db, 1).unwrap();
+        assert!(snatched.library_path.is_none());
+        assert!(snatched.linker.is_none());
+        assert!(stored(&db, 2).is_none());
+        let selection = select(
+            &db,
+            vec![audiobook(1, "Snatched Book", "m4b", true)],
+            Cost::Ratio,
+            false,
+        )
+        .await;
+        assert_eq!(selection, Selection::default());
+    }
+
+    #[tokio::test]
+    async fn test_snatched_torrent_counts_as_stored_upload() {
+        let db = database();
+        // A selected upload of the book in a format that isn't preferred stays selected
+        select(
+            &db,
+            vec![audiobook(1, "Book", "mp3", false)],
+            Cost::Ratio,
+            false,
+        )
+        .await;
+        let selection = select(
+            &db,
+            vec![audiobook(2, "Book", "m4b", true)],
+            Cost::Ratio,
+            false,
+        )
+        .await;
+        assert_eq!(selection.snatched, 1);
+        assert!(selected(&db, 1).is_some());
+        assert!(stored(&db, 2).is_some());
+
+        // Another upload that isn't preferred over the snatched one isn't selected
+        let db = database();
+        select(
+            &db,
+            vec![audiobook(1, "Book", "m4b", true)],
+            Cost::Ratio,
+            false,
+        )
+        .await;
+        let selection = select(
+            &db,
+            vec![audiobook(2, "Book", "m4b", false)],
+            Cost::Ratio,
+            false,
+        )
+        .await;
+        assert_eq!(selection, Selection::default());
+        assert!(selected(&db, 2).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_metadata_only_add_still_stores_snatched_torrents() {
+        let db = database();
+        let torrent = MaMTorrent {
+            owner_name: "uploader".to_owned(),
+            ..audiobook(1, "Book", "m4b", true)
+        };
+        let selection = select(&db, vec![torrent], Cost::MetadataOnlyAdd, false).await;
+        assert_eq!(selection, Selection::default());
+        assert_eq!(stored(&db, 1).unwrap().linker.as_deref(), Some("uploader"));
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_stores_no_snatched_torrents() {
+        let db = database();
+        let selection = select(
+            &db,
+            vec![audiobook(1, "Book", "m4b", true)],
+            Cost::Ratio,
+            true,
+        )
+        .await;
+        assert_eq!(selection.snatched, 1);
+        assert!(stored(&db, 1).is_none());
+    }
 
     #[test]
     fn test_selection_cost() {
