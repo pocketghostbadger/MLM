@@ -93,6 +93,6 @@ To keep ebooks out of an audiobook's folder, give the audiobook's torrent a qBit
 ```toml
 link_to_audiobooks_deny_tags = ["no-ebook-link"]
 ```
-On the next run, MLM takes out the ebooks it linked where a tag applies, and doesn't link them there again until the tag is removed. Create the tag in qBittorrent first, since the torrent page only lists tags that exist. If a qBittorrent instance can't be reached, MLM doesn't add links for ebook libraries with `link_to_audiobooks_deny_tags`, or remove any because of tags, until it can.
+On the next run, MLM takes out the ebooks it linked where a tag applies, and doesn't link them there again until the tag is removed. Create the tag in qBittorrent first, since the torrent page only lists tags that exist. If a qBittorrent instance can't be reached or doesn't answer within 30 seconds, MLM doesn't add links for ebook libraries with `link_to_audiobooks_deny_tags`, or remove any because of tags, until it can.
 
 With `link_to_audiobooks_existing = false`, an ebook and an audiobook are only paired if at least one of them was linked since MLM last started; each restart starts this over. Keep the ebook library's folder out of your Audiobookshelf libraries: by default, Audiobookshelf would list each ebook there as a book of its own.

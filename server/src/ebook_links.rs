@@ -7,6 +7,7 @@ use std::{
     io::{self, BufRead as _, ErrorKind},
     path::{Path, PathBuf},
     sync::Mutex,
+    time::Duration,
 };
 
 use anyhow::Result;
@@ -80,16 +81,20 @@ async fn qbit_tags(config: &Config) -> Option<HashMap<String, Vec<String>>> {
         return Some(tags);
     }
     for qbit_conf in &config.qbittorrent {
-        let torrents = match qbit::Api::new_login_username_password(
-            &qbit_conf.url,
-            &qbit_conf.username,
-            &qbit_conf.password,
-        )
+        // Every qBittorrent instance's linker runs this pass, so one that doesn't answer mustn't
+        // hold up the others
+        let torrents = tokio::time::timeout(Duration::from_secs(30), async {
+            let qbit = qbit::Api::new_login_username_password(
+                &qbit_conf.url,
+                &qbit_conf.username,
+                &qbit_conf.password,
+            )
+            .await?;
+            qbit.torrents(Some(TorrentListParams::default())).await
+        })
         .await
-        {
-            Ok(qbit) => qbit.torrents(Some(TorrentListParams::default())).await,
-            Err(err) => Err(err),
-        };
+        .map_err(|_| "timed out".to_owned())
+        .and_then(|torrents| torrents.map_err(|err| err.to_string()));
         match torrents {
             Ok(torrents) => {
                 // So the next outage is logged again
@@ -569,13 +574,48 @@ fn file_state(config: &Config, link: &EbookLink) -> FileState {
     }
 }
 
-/// A symlink to the ebook's own file, which was deleted, rather than on a share that isn't
-/// mounted
+/// A symlink in an audiobook folder to an ebook's file that's gone
 fn dangling(config: &Config, link: &EbookLink) -> bool {
     fs::symlink_metadata(windows_fs_path(&link.path)).is_ok_and(|m| m.file_type().is_symlink())
-        && fs::symlink_metadata(windows_fs_path(&link.source))
-            .is_err_and(|err| err.kind() == ErrorKind::NotFound)
-        && is_mounted(config, &link.source)
+        && file_gone(config, &link.source)
+}
+
+/// Whether an ebook's file in its library folder was deleted, or the download it's a symlink to,
+/// rather than on a share that isn't mounted
+fn file_gone(config: &Config, file: &Path) -> bool {
+    match fs::symlink_metadata(windows_fs_path(file)) {
+        Err(err) => err.kind() == ErrorKind::NotFound && is_mounted(config, file),
+        // With the symlink method, the ebook's file is a symlink to the download
+        Ok(meta) if meta.file_type().is_symlink() => {
+            fs::read_link(windows_fs_path(file)).is_ok_and(|target| {
+                let download = match file.parent() {
+                    Some(dir) => dir.join(target),
+                    None => target,
+                };
+                fs::metadata(windows_fs_path(&download))
+                    .is_err_and(|err| err.kind() == ErrorKind::NotFound)
+                    && download_gone(&download)
+            })
+        }
+        Ok(_) => false,
+    }
+}
+
+/// Whether a missing download is really gone, rather than on a share that isn't mounted: the first
+/// thing above it that exists is a folder with something in it, such as the downloads folder when
+/// the torrent's own folder was deleted with it. An unmounted share often shows as an empty folder,
+/// or as a symlink to a folder that isn't there
+fn download_gone(download: &Path) -> bool {
+    for dir in download.ancestors().skip(1) {
+        let dir = windows_fs_path(dir);
+        if dir.is_dir() {
+            return fs::read_dir(&dir).is_ok_and(|mut entries| entries.next().is_some());
+        }
+        if fs::symlink_metadata(&dir).is_ok() {
+            return false;
+        }
+    }
+    false
 }
 
 /// Whether a missing file is really gone, rather than on a share that isn't mounted: its folder
@@ -742,10 +782,14 @@ fn candidate<'a>(config: &'a Config, ebook: &'a Torrent) -> Option<Candidate<'a>
     if !filters.link_to_audiobooks || library.method() == LibraryLinkMethod::NoLink {
         return None;
     }
+    let dir = ebook.library_path.as_ref()?;
     ebook
         .library_files
         .iter()
         .filter_map(|file| Some((format_rank(&filters.link_to_audiobooks_types, file)?, file)))
+        // A file that's gone, as when its download was deleted, mustn't keep another ebook out.
+        // One on a share that isn't mounted still counts, so the folder waits for it
+        .filter(|(_, file)| !file_gone(config, &dir.join(file)))
         .min()
         .map(|(rank, file)| Candidate {
             ebook,
@@ -1611,6 +1655,65 @@ method = \"symlink\"");
         link_ebooks_to_audiobooks(&config, &db).await.unwrap();
         assert!(fs::symlink_metadata(&linked).is_err());
         assert!(links(&db).is_empty());
+    }
+
+    #[cfg(target_family = "unix")]
+    #[tokio::test]
+    async fn test_symlink_to_a_deleted_download() {
+        let dir = TestDir::new();
+        let config = config(&dir.0, "link_to_audiobooks = true\nmethod = \"symlink\"");
+        let db = database();
+        let (_, ebook, audio_dir) = dune(&db, &dir.0, "download");
+        // The ebook library linked its file as a symlink to the download, in the torrent's folder
+        let downloads = dir.0.join("downloads");
+        let torrent_dir = downloads.join("Dune [epub]");
+        fs::create_dir_all(&torrent_dir).unwrap();
+        fs::write(downloads.join("other.epub"), "other").unwrap();
+        let download = torrent_dir.join("Dune.epub");
+        fs::write(&download, "download").unwrap();
+        let library_file = ebook.library_path.as_ref().unwrap().join("Dune.epub");
+        fs::remove_file(&library_file).unwrap();
+        std::os::unix::fs::symlink(&download, &library_file).unwrap();
+        link_ebooks_to_audiobooks(&config, &db).await.unwrap();
+        let linked = audio_dir.join("Dune.epub");
+        assert_eq!(fs::read_to_string(&linked).unwrap(), "download");
+
+        // The downloads share isn't mounted, an empty folder in its place: the link stays
+        let unmounted = dir.0.join("downloads unmounted");
+        fs::rename(&downloads, &unmounted).unwrap();
+        fs::create_dir(&downloads).unwrap();
+        link_ebooks_to_audiobooks(&config, &db).await.unwrap();
+        assert!(fs::symlink_metadata(&linked).is_ok());
+        assert_eq!(links(&db).len(), 1);
+        // and the ebook still counts as a candidate, so no other one takes a free folder meanwhile
+        assert!(!file_gone(&config, &library_file));
+
+        // The downloads folder a symlink to a share that isn't mounted: the link stays
+        fs::remove_dir(&downloads).unwrap();
+        std::os::unix::fs::symlink(dir.0.join("not mounted"), &downloads).unwrap();
+        link_ebooks_to_audiobooks(&config, &db).await.unwrap();
+        assert!(fs::symlink_metadata(&linked).is_ok());
+        assert_eq!(links(&db).len(), 1);
+        assert!(!file_gone(&config, &library_file));
+
+        // An older ebook of the book, from another torrent
+        let mut older = self::linked(
+            &db,
+            torrent("ebook-older", MediaType::Ebook, None),
+            dir.0.join("ebooks/Frank Herbert/Dune (older)"),
+            &["Dune.epub"],
+        );
+        older.created_at = Timestamp::from(time::UtcDateTime::UNIX_EPOCH);
+        save(&db, &older);
+
+        // The torrent deleted with its folder: the link goes, and the older ebook takes its place
+        fs::remove_file(&downloads).unwrap();
+        fs::rename(&unmounted, &downloads).unwrap();
+        fs::remove_dir_all(&torrent_dir).unwrap();
+        link_ebooks_to_audiobooks(&config, &db).await.unwrap();
+        assert_eq!(fs::read_to_string(&linked).unwrap(), "ebook-older Dune.epub");
+        assert_eq!(links(&db).len(), 1);
+        assert_eq!(links(&db)[0].ebook_id, "ebook-older");
     }
 
     #[cfg(target_family = "unix")]
