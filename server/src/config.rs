@@ -304,6 +304,18 @@ pub struct LibraryTagFilters {
     pub deny_tags: Vec<String>,
     pub audio_types: Option<Vec<String>>,
     pub ebook_types: Option<Vec<String>>,
+
+    /// Also link this library's ebooks into the folders of matching audiobooks
+    #[serde(default)]
+    pub link_to_audiobooks: bool,
+    #[serde(default = "default_link_to_audiobooks_types")]
+    pub link_to_audiobooks_types: Vec<String>,
+    /// Also pair books that were both linked before MLM last started
+    #[serde(default = "default_true")]
+    pub link_to_audiobooks_existing: bool,
+    /// qBittorrent tags that keep an ebook out of an audiobook's folder, on either torrent
+    #[serde(default)]
+    pub link_to_audiobooks_deny_tags: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Default, PartialEq, Eq)]
@@ -362,6 +374,14 @@ fn default_ebook_types() -> Vec<String> {
         .iter()
         .map(ToString::to_string)
         .collect()
+}
+
+fn default_link_to_audiobooks_types() -> Vec<String> {
+    vec!["epub".to_owned()]
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_music_types() -> Vec<String> {

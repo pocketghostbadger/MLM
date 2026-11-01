@@ -6,6 +6,7 @@ mod backoff;
 mod cleaner;
 mod config;
 mod config_impl;
+mod ebook_links;
 mod exporter;
 mod linker;
 mod lists;
@@ -198,6 +199,7 @@ async fn app_main() -> Result<()> {
 
     let db = native_db::Builder::new().create(&mlm_db::MODELS, database_file)?;
     mlm_db::migrate(&db)?;
+    ebook_links::note_start();
 
     if env::args().any(|arg| arg == "--update-search-title") {
         mlm_db::update_search_title(&db)?;
@@ -531,6 +533,11 @@ async fn app_main() -> Result<()> {
                                     stats.cleaner_result = Some(result);
                                 })
                                 .await;
+                        }
+                        if let Err(err) =
+                            ebook_links::link_ebooks_to_audiobooks(&config, &db).await
+                        {
+                            error!("Error linking ebooks to audiobooks: {err:?}");
                         }
                     }
                 });

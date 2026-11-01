@@ -41,8 +41,9 @@ use crate::{
     audiobookshelf::{self as abs},
     autograbber::update_torrent_meta,
     backoff::Backoff,
-    cleaner::remove_library_files,
+    cleaner::{delete_from_abs, remove_library_files},
     config::{Config, Library, LibraryLinkMethod, QbitConfig},
+    ebook_links::{self, LinksGuard, can_remove_ebook_links_in, remove_ebook_links_in},
     logging::{TorrentMetaError, update_errored_torrent, write_event},
     qbittorrent::ensure_category_exists,
 };
@@ -418,6 +419,7 @@ async fn match_torrent(
         }
     };
 
+    let links = ebook_links::lock().await;
     link_torrent(
         &config,
         qbit.0,
@@ -431,6 +433,7 @@ async fn match_torrent(
         mam_torrent,
         existing_torrent.as_ref(),
         &meta,
+        &links,
     )
     .await
     .context("link_torrent")
@@ -543,8 +546,32 @@ pub async fn refresh_metadata_relink(
             library,
             &torrent.meta,
         );
-    remove_library_files(config, &torrent, library_path_changed).await?;
-    link_torrent(
+    let links = ebook_links::lock().await;
+    // Before anything is removed, so an ebook linked into a folder it can go into, which
+    // link_torrent removes, stops the relink while the old files are still there if it can't be
+    // checked. Which of the two folders link_torrent uses depends on what's left of the old one
+    if library.method() != LibraryLinkMethod::NoLink {
+        let mut dirs = [
+            library_dir(config.exclude_narrator_in_library_dir, library, &torrent.meta),
+            library_dir(false, library, &torrent.meta),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        dirs.dedup();
+        for dir in dirs {
+            if !can_remove_ebook_links_in(db, config, &dir, &links)? {
+                bail!("Could not check an ebook linked into {dir:?}, see the log");
+            }
+        }
+    }
+    remove_library_files(config, db, &torrent, &links).await?;
+    // Once the old files are gone, and before relinking, so Audiobookshelf can't move its item to
+    // the new folder first
+    if library_path_changed {
+        delete_from_abs(config, &torrent).await;
+    }
+    let result = link_torrent(
         config,
         qbit_conf,
         db,
@@ -557,10 +584,19 @@ pub async fn refresh_metadata_relink(
         mam_torrent,
         Some(&torrent),
         &torrent.meta,
+        &links,
     )
     .await
     .context("link_torrent")
-    .map_err(|err| anyhow::Error::new(TorrentMetaError(torrent.meta, err)))
+    .map_err(|err| anyhow::Error::new(TorrentMetaError(torrent.meta.clone(), err)));
+    drop(links);
+    // Pair the relinked torrent again now rather than on the next linker run
+    if result.is_ok()
+        && let Err(err) = ebook_links::link_ebooks_to_audiobooks(config, db).await
+    {
+        error!("Error linking ebooks to audiobooks: {err:?}");
+    }
+    result
 }
 
 #[instrument(skip_all)]
@@ -578,6 +614,7 @@ async fn link_torrent(
     mam_torrent: MaMTorrent,
     existing_torrent: Option<&Torrent>,
     meta: &TorrentMeta,
+    links: &LinksGuard,
 ) -> Result<()> {
     let mut library_files = vec![];
 
@@ -592,6 +629,11 @@ async fn link_torrent(
         let metadata = abs::create_metadata(&mam_torrent, meta);
 
         create_dir_all(&dir).await?;
+        // An ebook linked here from another torrent mustn't be taken for one of this torrent's
+        // files, or written over
+        if !remove_ebook_links_in(db, config, &dir, links).await? {
+            bail!("Could not remove an ebook linked into {dir:?}, see the log");
+        }
         for file in files {
             let span = span!(Level::TRACE, "file: {:?}", file.name);
             let _s = span.enter();
@@ -949,7 +991,7 @@ fn qbit_file_path(file_name: &str) -> PathBuf {
 }
 
 #[cfg(target_family = "windows")]
-fn windows_fs_path(path: &Path) -> PathBuf {
+pub(crate) fn windows_fs_path(path: &Path) -> PathBuf {
     if !path.is_absolute() {
         return path.to_path_buf();
     }
@@ -964,7 +1006,7 @@ fn windows_fs_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(not(target_family = "windows"))]
-fn windows_fs_path(path: &Path) -> PathBuf {
+pub(crate) fn windows_fs_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 

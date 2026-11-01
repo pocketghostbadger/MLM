@@ -107,6 +107,10 @@ library_dir = "/mnt/Data/Library/Audiobooks"
 [[library]]
 download_dir = "/mnt/Data/Downloads/Ebooks" # you can also specify a library using the download_dir
 library_dir = "/mnt/Data/Library/Ebooks"
+link_to_audiobooks = false # also link this library's ebooks into the folders of matching audiobooks
+link_to_audiobooks_types = ["epub"] # formats that go into audiobook folders, in order of preference
+link_to_audiobooks_existing = true # also pair books that were both linked before MLM last started
+link_to_audiobooks_deny_tags = [] # qBittorrent tags that keep an ebook out of an audiobook's folder, on either torrent
 
 [[library]]
 download_dir = "/mnt/Data/Uploads/Audiobooks" # multiple libraries can contribute to the same library dir, for example if you keep your own uploads separate
