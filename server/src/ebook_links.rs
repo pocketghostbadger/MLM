@@ -562,13 +562,15 @@ fn file_state(config: &Config, link: &EbookLink) -> FileState {
             Some(current) if link.file_id.as_ref() == Some(&current) => FileState::Linked,
             // A hardlink is still the ebook's own file, and a copy still has its content, even
             // if file ids changed since it was linked
-            Some(current)
-                if file_id(&link.source).as_ref() == Some(&current)
-                    || same_content(&link.source, &link.path) =>
-            {
-                FileState::Linked
-            }
-            Some(_) => FileState::Other,
+            Some(current) if file_id(&link.source).as_ref() == Some(&current) => FileState::Linked,
+            Some(_) => match same_content(&link.source, &link.path) {
+                Ok(true) => FileState::Linked,
+                Ok(false) => FileState::Other,
+                // The ebook's own file is gone for good, so the copy can't be told apart any more
+                Err(_) if file_gone(config, &link.source) => FileState::Other,
+                // Can't be compared now, as on a share that isn't mounted: checked again on each run
+                Err(_) => FileState::Unknown,
+            },
             None => FileState::Unknown,
         },
     }
@@ -657,27 +659,24 @@ async fn refresh_file_id(db: &Database<'_>, link: &EbookLink) -> Result<()> {
     Ok(())
 }
 
-fn same_content(a: &Path, b: &Path) -> bool {
-    let (Ok(a), Ok(b)) = (
-        File::open(windows_fs_path(a)),
-        File::open(windows_fs_path(b)),
-    ) else {
-        return false;
-    };
-    if a.metadata().map(|m| m.len()).ok() != b.metadata().map(|m| m.len()).ok() {
-        return false;
+/// Whether two files have the same content, or an error if either can't be read
+fn same_content(a: &Path, b: &Path) -> io::Result<bool> {
+    let (a, b) = (
+        File::open(windows_fs_path(a))?,
+        File::open(windows_fs_path(b))?,
+    );
+    if a.metadata()?.len() != b.metadata()?.len() {
+        return Ok(false);
     }
     let (mut a, mut b) = (io::BufReader::new(a), io::BufReader::new(b));
     loop {
-        let (Ok(chunk_a), Ok(chunk_b)) = (a.fill_buf(), b.fill_buf()) else {
-            return false;
-        };
+        let (chunk_a, chunk_b) = (a.fill_buf()?, b.fill_buf()?);
         let len = chunk_a.len().min(chunk_b.len());
         if len == 0 {
-            return chunk_a.is_empty() && chunk_b.is_empty();
+            return Ok(chunk_a.is_empty() && chunk_b.is_empty());
         }
         if chunk_a[..len] != chunk_b[..len] {
-            return false;
+            return Ok(false);
         }
         a.consume(len);
         b.consume(len);
@@ -1761,8 +1760,26 @@ method = \"copy\"",
         rw.upsert(link.clone()).unwrap();
         rw.commit().unwrap();
         assert!(matches!(file_state(&config, &link), FileState::Linked));
+
+        // The ebook library's share isn't mounted, an empty folder in its place: the copy can't
+        // be compared, and the record stays
+        let ebooks = dir.0.join("ebooks");
+        let unmounted = dir.0.join("ebooks unmounted");
+        fs::rename(&ebooks, &unmounted).unwrap();
+        fs::create_dir(&ebooks).unwrap();
+        assert!(matches!(file_state(&config, &link), FileState::Unknown));
+        link_ebooks_to_audiobooks(&config, &db).await.unwrap();
+        assert_eq!(links(&db), vec![link.clone()]);
+
+        // Mounted again: recognised, and its new file id stored
+        fs::remove_dir(&ebooks).unwrap();
+        fs::rename(&unmounted, &ebooks).unwrap();
         link_ebooks_to_audiobooks(&config, &db).await.unwrap();
         assert_eq!(links(&db)[0].file_id, real_id);
+
+        // The ebook's own file deleted for good: the copy can't be told apart, so it's left alone
+        fs::remove_file(&link.source).unwrap();
+        assert!(matches!(file_state(&config, &link), FileState::Other));
     }
 
     #[test]
@@ -1834,9 +1851,9 @@ method = \"copy\"",
         fs::write(&a, "ebook").unwrap();
         fs::write(&b, "ebook").unwrap();
         fs::write(&c, "other").unwrap();
-        assert!(same_content(&a, &b));
-        assert!(!same_content(&a, &c));
-        assert!(!same_content(&a, &dir.0.join("missing")));
+        assert!(same_content(&a, &b).unwrap());
+        assert!(!same_content(&a, &c).unwrap());
+        assert!(same_content(&a, &dir.0.join("missing")).is_err());
     }
 
     #[tokio::test]
