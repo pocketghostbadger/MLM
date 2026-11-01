@@ -11,13 +11,15 @@ impl TorrentMeta {
     pub fn matches(&self, other: &TorrentMeta) -> bool {
         self.media_type.matches(other.media_type)
             && self.language == other.language
-            && (self.edition.is_none() == other.edition.is_none()
-                || self.edition.as_ref().is_some_and(|this| {
-                    other
-                        .edition
-                        .as_ref()
-                        .is_some_and(|that| this.1 == that.1 && (this.1 != 0 || this.0 == that.0))
-                }))
+            && match (&self.edition, &other.edition) {
+                (None, None) => true,
+                // Named editions without a number, like "Unabridged Edition", match on the name
+                (Some(this), Some(that)) => {
+                    this.1 == that.1
+                        && (this.1 != 0 || this.0.to_lowercase() == that.0.to_lowercase())
+                }
+                _ => false,
+            }
             && self.authors.iter().any(|a| other.authors.contains(a))
             && ((self.narrators.is_empty() && other.narrators.is_empty())
                 || self.narrators.iter().any(|a| other.narrators.contains(a)))
@@ -244,5 +246,83 @@ impl fmt::Display for MetadataSource {
             MetadataSource::Mam => write!(f, "MaM"),
             MetadataSource::Manual => write!(f, "Manual"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Size, Timestamp};
+
+    fn meta(edition: Option<(&str, u64)>) -> TorrentMeta {
+        TorrentMeta {
+            mam_id: 0,
+            vip_status: None,
+            cat: None,
+            media_type: MediaType::Audiobook,
+            main_cat: None,
+            categories: vec![],
+            language: None,
+            flags: None,
+            filetypes: vec![],
+            num_files: 0,
+            size: Size::from_bytes(0),
+            title: "Book".to_owned(),
+            edition: edition.map(|(name, number)| (name.to_owned(), number)),
+            authors: vec!["Author".to_owned()],
+            narrators: vec![],
+            series: vec![],
+            source: MetadataSource::Mam,
+            uploaded_at: Timestamp::now(),
+        }
+    }
+
+    fn assert_match(a: Option<(&str, u64)>, b: Option<(&str, u64)>, expected: bool) {
+        assert_eq!(meta(a).matches(&meta(b)), expected, "{a:?} vs {b:?}");
+        assert_eq!(meta(b).matches(&meta(a)), expected, "{b:?} vs {a:?}");
+    }
+
+    #[test]
+    fn test_matches_without_editions() {
+        assert_match(None, None, true);
+    }
+
+    #[test]
+    fn test_matches_same_edition_number() {
+        assert_match(Some(("2nd Edition", 2)), Some(("Second Edition", 2)), true);
+    }
+
+    #[test]
+    fn test_differing_edition_numbers_dont_match() {
+        assert_match(Some(("2nd Edition", 2)), Some(("3rd Edition", 3)), false);
+    }
+
+    #[test]
+    fn test_edition_doesnt_match_no_edition() {
+        assert_match(Some(("2nd Edition", 2)), None, false);
+        assert_match(Some(("Unabridged Edition", 0)), None, false);
+    }
+
+    #[test]
+    fn test_named_editions_match_on_name() {
+        assert_match(
+            Some(("Unabridged Edition", 0)),
+            Some(("UNABRIDGED EDITION", 0)),
+            true,
+        );
+        assert_match(
+            Some(("Unabridged Edition", 0)),
+            Some(("Abridged Edition", 0)),
+            false,
+        );
+    }
+
+    #[test]
+    fn test_named_edition_doesnt_match_numbered() {
+        assert_match(
+            Some(("Unabridged Edition", 0)),
+            Some(("2nd Edition", 2)),
+            false,
+        );
     }
 }
