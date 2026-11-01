@@ -246,12 +246,17 @@ async fn search_item(
 
     let mut selected_torrents = 0;
     if let Some(audiobook) = audiobook {
-        if mark_selected(&mut db_item.audio_torrent, audiobook) && !list.dry_run {
+        if mark_found(
+            &mut db_item.audio_torrent,
+            audiobook,
+            TorrentStatus::Selected,
+        ) && !list.dry_run
+        {
             let (_guard, rw) = db.rw_async().await?;
             rw.upsert(db_item.clone())?;
             rw.commit()?;
         }
-        selected_torrents += select_torrents(
+        let selection = select_torrents(
             config,
             db,
             mam,
@@ -267,17 +272,30 @@ async fn search_item(
         )
         .await
         .context("select_torrents")?;
+        if selection.snatched > 0
+            && mark_found(
+                &mut db_item.audio_torrent,
+                audiobook,
+                TorrentStatus::Existing,
+            )
+            && !list.dry_run
+        {
+            let (_guard, rw) = db.rw_async().await?;
+            rw.upsert(db_item.clone())?;
+            rw.commit()?;
+        }
+        selected_torrents += selection.selected;
     }
     // When the audiobook took the last unsat slot, the ebook waits for the next run
     if let Some(ebook) = ebook
         && selected_torrents < max_torrents
     {
-        if mark_selected(&mut db_item.ebook_torrent, ebook) && !list.dry_run {
+        if mark_found(&mut db_item.ebook_torrent, ebook, TorrentStatus::Selected) && !list.dry_run {
             let (_guard, rw) = db.rw_async().await?;
             rw.upsert(db_item.clone())?;
             rw.commit()?;
         }
-        selected_torrents += select_torrents(
+        let selection = select_torrents(
             config,
             db,
             mam,
@@ -293,6 +311,15 @@ async fn search_item(
         )
         .await
         .context("select_torrents")?;
+        if selection.snatched > 0
+            && mark_found(&mut db_item.ebook_torrent, ebook, TorrentStatus::Existing)
+            && !list.dry_run
+        {
+            let (_guard, rw) = db.rw_async().await?;
+            rw.upsert(db_item.clone())?;
+            rw.commit()?;
+        }
+        selected_torrents += selection.selected;
     }
 
     Ok(selected_torrents)
@@ -658,20 +685,22 @@ fn select_torrent(
         })
 }
 
-/// Records a torrent as selected for a list item, returns whether that changed the item
-fn mark_selected(
+/// Records a torrent for a list item, as selected or, when it was skipped as already snatched, as
+/// found in the library where `select_torrents` stored it. Returns whether that changed the item
+fn mark_found(
     field: &mut Option<ListItemTorrent>,
     found: &(MaMTorrent, TorrentMeta, usize, Grab),
+    status: TorrentStatus,
 ) -> bool {
     if field
         .as_ref()
-        .is_some_and(|t| t.status == TorrentStatus::Selected && t.mam_id == found.0.id)
+        .is_some_and(|t| t.status == status && t.mam_id == found.0.id)
     {
         return false;
     }
     field.replace(ListItemTorrent {
         mam_id: found.0.id,
-        status: TorrentStatus::Selected,
+        status,
         at: Timestamp::now(),
     });
     true
@@ -965,6 +994,34 @@ mod tests {
             select(&torrents, OldMainCat::Ebook),
             (Some((2, Cost::Ratio)), None)
         );
+    }
+
+    #[test]
+    fn test_snatched_torrent_shows_as_found() {
+        let mut item = list_item("The Example Book", &["Ann Author"]);
+        let grabs = grabs(AUDIOBOOK_GRABS);
+        let torrents = block_matches(
+            &item,
+            &grabs,
+            &[audiobook(
+                1,
+                "The Example Book",
+                "Ann Author",
+                "300 MiB",
+                false,
+            )],
+        );
+        let found = select_torrent(&torrents, OldMainCat::Audio).unwrap();
+
+        // search_item marks it selected before select_torrents skips it as snatched
+        let mut mark = |status| mark_found(&mut item.audio_torrent, found, status);
+        assert!(mark(TorrentStatus::Selected));
+        assert!(mark(TorrentStatus::Existing));
+        assert!(!mark(TorrentStatus::Existing));
+        let field = item.audio_torrent.as_ref().unwrap();
+        assert_eq!((field.mam_id, &field.status), (1, &TorrentStatus::Existing));
+        // The audiobook isn't searched for again
+        assert!(!item.want_audio());
     }
 
     /// Fetches a real shelf and another shelf of the same user through the widget, run with

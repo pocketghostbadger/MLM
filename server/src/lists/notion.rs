@@ -97,7 +97,7 @@ pub async fn run_notion_import(
                     )
                     .await
                     .context("select_torrents")?;
-                    max_torrents = max_torrents.saturating_sub(selected);
+                    max_torrents = max_torrents.saturating_sub(selected.selected);
                     continue 'torrent;
                 }
             }

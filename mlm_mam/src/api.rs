@@ -206,6 +206,23 @@ impl<'a> MaM<'a> {
         Ok(mam)
     }
 
+    /// A client for tests that sends every request to a closed local port instead, so it can never
+    /// reach MaM
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn offline(db: Arc<Database<'a>>) -> MaM<'a> {
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
+            .build()
+            .unwrap();
+        MaM {
+            jar: Default::default(),
+            client,
+            db,
+            user: Default::default(),
+            pause: Default::default(),
+        }
+    }
+
     /// The pause in effect, if requests to MaM are paused
     pub fn requests_paused(&self) -> Option<RequestsPausedError> {
         self.pause.lock().unwrap().paused(Instant::now())
@@ -556,20 +573,10 @@ mod tests {
     async fn test_paused_requests_are_not_sent() {
         // Every request goes to a closed local port instead, so this can never reach MaM, even
         // if the pause stopped working
-        let client = reqwest::Client::builder()
-            .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
-            .build()
-            .unwrap();
         let db = native_db::Builder::new()
             .create_in_memory(&mlm_db::MODELS)
             .unwrap();
-        let mam = MaM {
-            jar: Default::default(),
-            client,
-            db: Arc::new(db),
-            user: Default::default(),
-            pause: Default::default(),
-        };
+        let mam = MaM::offline(Arc::new(db));
         assert!(mam.requests_paused().is_none());
         assert!(mam.paused_until().is_none());
         let start = Instant::now();

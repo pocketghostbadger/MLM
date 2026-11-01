@@ -4,6 +4,8 @@ Autograbbers are predefined searches that are run periodically. Very similar to 
 MLM monitors both your ratio and your unsat slots to try and avoid causing any problems for your account.
 By default MLM will never download a torrent that will take you below 2 in ratio, and always leave 10 unsats slots free.
 
+Torrents your account has already snatched are skipped, here and in Goodreads and Notion lists. MaM's search results mark a snatch 5 to 20 minutes after it happens. MLM stores a skipped torrent without files, so its search page shows it as downloaded, and another upload of the same book is only selected if its format comes earlier in `audio_types` or `ebook_types`. To download a skipped torrent anyway, open it from MLM's search page, click "remove torrent from MLM", then "Download with Ratio", or "Download as ..." if it's VIP or freeleech.
+
 A basic configuration for an autograbber look like this:
 ```toml
 [[autograb]]
