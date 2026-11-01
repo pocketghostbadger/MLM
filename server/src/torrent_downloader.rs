@@ -20,7 +20,9 @@ use tokio::time::sleep;
 use tracing::{debug, info, instrument, trace};
 
 use crate::{
+    autograbber::add_metadata_only_torrent,
     config::Config,
+    lists::mark_snatched_existing,
     logging::{TorrentMetaError, update_errored_torrent, write_event},
     qbittorrent::add_torrent_with_category,
 };
@@ -92,6 +94,9 @@ pub async fn grab_selected_torrents(
         }
 
         let result = grab_torrent(config, db, qbit, qbit_url, mam, torrent.clone()).await;
+        // A selection skipped as already snatched uses no unsat slot and no ratio
+        let skipped = matches!(result, Ok(Grabbed::SkippedSnatched));
+        let result = result.map(|_| ());
 
         // Once MaM rate limits a request or blocks the account, requests to MaM are paused, so
         // the other selections wait for a later pass. A grab that wasn't sent because of the
@@ -119,8 +124,7 @@ pub async fn grab_selected_torrents(
         let result =
             result.map_err(|err| anyhow::Error::new(TorrentMetaError(torrent.meta.clone(), err)));
 
-
-        if result.is_ok() {
+        if result.is_ok() && !skipped {
             snatched_torrents += 1;
             remaining_buffer = buffer_after;
         }
@@ -170,6 +174,8 @@ pub enum NotGrabbed {
     NotOnMam,
     #[error("Torrent was already snatched, so no wedge is used on it")]
     AlreadySnatched,
+    #[error("Torrent was already snatched, so it isn't downloaded again")]
+    SkippedSnatched,
     #[error("Torrent is no longer free, expected: {0:?}")]
     NoLongerFree(TorrentCost),
 }
@@ -189,28 +195,36 @@ fn wedge_not_needed(info: &MaMTorrent) -> bool {
     info.is_free() || info.vip
 }
 
-/// Whether deciding what a selection spends needs the torrent as MaM returns it now. This has to
-/// agree with `decide_spend`, which takes a missing lookup to mean that MaM didn't return it
-fn needs_lookup(cost: TorrentCost, wedges: u64, wedge_buffer: u64) -> bool {
+/// Whether deciding what a selection spends needs the torrent as MaM returns it now. With
+/// `skip_snatched`, every selection that can be downloaded is looked up, so that one the account
+/// already snatched is skipped. A wedge selection without enough wedges isn't downloaded. This has
+/// to agree with `decide_spend`, which takes a missing lookup to mean that MaM didn't return it
+fn needs_lookup(cost: TorrentCost, wedges: u64, wedge_buffer: u64, skip_snatched: bool) -> bool {
     match cost {
         TorrentCost::GlobalFreeleech | TorrentCost::PersonalFreeleech | TorrentCost::Vip => true,
-        TorrentCost::UseWedge | TorrentCost::TryWedge => wedges > wedge_buffer,
-        TorrentCost::Ratio => false,
+        TorrentCost::UseWedge => wedges > wedge_buffer,
+        TorrentCost::TryWedge => wedges > wedge_buffer || skip_snatched,
+        TorrentCost::Ratio => skip_snatched,
     }
 }
 
 /// Decides what grabbing a selection spends. `info` is the torrent as MaM returns it now,
 /// looked up when `needs_lookup` says so.
 ///
-/// A selection that was free when it was picked is only grabbed while it's still free. No wedge
-/// is used on a torrent that's already free or VIP, or on one that was already snatched, which
-/// is probably in a client already.
+/// With `skip_snatched`, a torrent the account already snatched isn't grabbed at all. A selection
+/// that was free when it was picked is only grabbed while it's still free. No wedge is used on a
+/// torrent that's already free or VIP, or on one that was already snatched, which is probably in
+/// a client already.
 fn decide_spend(
     cost: TorrentCost,
     wedges: u64,
     wedge_buffer: u64,
+    skip_snatched: bool,
     info: Option<&MaMTorrent>,
 ) -> Result<Spend, NotGrabbed> {
+    if skip_snatched && info.is_some_and(|info| info.my_snatched) {
+        return Err(NotGrabbed::SkippedSnatched);
+    }
     match cost {
         TorrentCost::GlobalFreeleech | TorrentCost::PersonalFreeleech | TorrentCost::Vip => {
             match info {
@@ -257,6 +271,15 @@ fn grabbed_event(hash: String, torrent: &SelectedTorrent, wedged: bool) -> Event
     )
 }
 
+/// What became of a selection that was handled without an error
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grabbed {
+    /// Added to qBittorrent, or found in a client or the library already
+    Done,
+    /// Not downloaded because the account already snatched it, and stored without files
+    SkippedSnatched,
+}
+
 #[instrument(skip_all)]
 async fn grab_torrent(
     config: &Config,
@@ -265,7 +288,7 @@ async fn grab_torrent(
     qbit_url: &str,
     mam: &MaM<'_>,
     torrent: SelectedTorrent,
-) -> Result<()> {
+) -> Result<Grabbed> {
     info!(
         "Grabbing torrent \"{}\", with category {:?} and tags {:?}",
         torrent.meta.title, torrent.category, torrent.tags,
@@ -285,32 +308,42 @@ async fn grab_torrent(
         let (_guard, rw) = db.rw_async().await?;
         rw.remove(torrent)?;
         rw.commit()?;
-        return Ok(());
+        return Ok(Grabbed::Done);
     }
 
     let user_info = mam.user_info().await?;
     let wedge_buffer = torrent.wedge_buffer.unwrap_or(config.wedge_buffer);
-    let info = if needs_lookup(torrent.cost, user_info.wedges, wedge_buffer) {
+    // Selections made by hand are downloaded even when the account already snatched them
+    let skip_snatched = !torrent.by_hand;
+    let info = if needs_lookup(torrent.cost, user_info.wedges, wedge_buffer, skip_snatched) {
         mam.get_torrent_info_by_id(torrent.mam_id).await?
     } else {
         None
     };
-    // A torrent that isn't grabbed at its cost may still be in a client already. It's then
-    // recorded like any other duplicate, after downloading its torrent file without `fl`
-    let (will_wedge, refused) =
-        match decide_spend(torrent.cost, user_info.wedges, wedge_buffer, info.as_ref()) {
-            Ok(spend) => {
-                debug!(
-                    "Grabbing torrent \"{}\" spends {spend:?}",
-                    torrent.meta.title
-                );
-                (spend == Spend::Wedge, None)
-            }
-            Err(err @ (NotGrabbed::AlreadySnatched | NotGrabbed::NoLongerFree(_))) => {
-                (false, Some(err))
-            }
-            Err(err) => return Err(err.into()),
-        };
+    // A torrent that isn't grabbed at its cost, or that the account already snatched, may still
+    // be in a client already. It's then recorded like any other duplicate, after downloading its
+    // torrent file without `fl`
+    let (will_wedge, refused) = match decide_spend(
+        torrent.cost,
+        user_info.wedges,
+        wedge_buffer,
+        skip_snatched,
+        info.as_ref(),
+    ) {
+        Ok(spend) => {
+            debug!(
+                "Grabbing torrent \"{}\" spends {spend:?}",
+                torrent.meta.title
+            );
+            (spend == Spend::Wedge, None)
+        }
+        Err(
+            err @ (NotGrabbed::AlreadySnatched
+            | NotGrabbed::SkippedSnatched
+            | NotGrabbed::NoLongerFree(_)),
+        ) => (false, Some(err)),
+        Err(err) => return Err(err.into()),
+    };
     if will_wedge {
         info!("Using wedge on torrent \"{}\"", torrent.meta.title);
     }
@@ -373,7 +406,7 @@ async fn grab_torrent(
         }
         rw.commit()?;
 
-        return Ok(());
+        return Ok(Grabbed::Done);
     }
 
     let library_existing = {
@@ -387,9 +420,19 @@ async fn grab_torrent(
         let (_guard, rw) = db.rw_async().await?;
         rw.remove(torrent)?;
         rw.commit()?;
-        return Ok(());
+        return Ok(Grabbed::Done);
     }
 
+    if let Some(NotGrabbed::SkippedSnatched) = refused
+        && let Some(info) = info
+    {
+        info!(
+            "Skipping torrent \"{}\" as it was already snatched, storing it without files",
+            torrent.meta.title
+        );
+        store_snatched(db, torrent, info).await?;
+        return Ok(Grabbed::SkippedSnatched);
+    }
     if let Some(err) = refused {
         return Err(err.into());
     }
@@ -452,7 +495,30 @@ async fn grab_torrent(
         write_event(db, event).await;
     }
 
-    Ok(())
+    Ok(Grabbed::Done)
+}
+
+/// Stores a selection the account already snatched the way `select_torrents` stores a torrent it
+/// skips: without files, unless MLM has a record of it already, and as found in the library on
+/// the list items that selected it
+async fn store_snatched(
+    db: &Database<'_>,
+    torrent: SelectedTorrent,
+    info: MaMTorrent,
+) -> Result<()> {
+    let (guard, rw) = db.rw_async().await?;
+    mark_snatched_existing(&rw, torrent.mam_id)?;
+    let recorded = rw
+        .get()
+        .secondary::<mlm_db::Torrent>(TorrentKey::mam_id, torrent.mam_id)?
+        .is_some();
+    let meta = torrent.meta.clone();
+    rw.remove(torrent)?;
+    if recorded {
+        rw.commit()?;
+        return Ok(());
+    }
+    add_metadata_only_torrent((guard, rw), info, meta, false).await
 }
 
 /// Stores a torrent's record under its hash. A metadata only record of the same torrent, such as
@@ -574,6 +640,8 @@ async fn fetch_torrent_file(
 
 #[cfg(test)]
 mod tests {
+    use mlm_db::TorrentStatus;
+
     use super::*;
 
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -600,37 +668,33 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_hash_record_replaces_metadata_only_record() {
-        let database = || {
-            native_db::Builder::new()
-                .create_in_memory(&mlm_db::MODELS)
-                .unwrap()
-        };
-        let stored = |db: &Database<'_>| -> Vec<mlm_db::Torrent> {
-            db.r_transaction()
-                .unwrap()
-                .scan()
-                .primary()
-                .unwrap()
-                .all()
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap()
-        };
-        let put = |db: &Database<'_>, record: mlm_db::Torrent| {
-            let rw = db.rw_transaction().unwrap();
-            rw.upsert(record).unwrap();
-            rw.commit().unwrap();
-        };
-        let store_by_hash = |db: &Database<'_>, record: mlm_db::Torrent| -> Result<()> {
-            let rw = db.rw_transaction()?;
-            upsert_hash_record(&rw, record)?;
-            rw.commit()?;
-            Ok(())
-        };
+    fn database() -> Database<'static> {
+        native_db::Builder::new()
+            .create_in_memory(&mlm_db::MODELS)
+            .unwrap()
+    }
 
-        let torrent = MaMTorrent {
+    fn stored<T: native_db::ToInput>(db: &Database<'_>) -> Vec<T> {
+        db.r_transaction()
+            .unwrap()
+            .scan()
+            .primary()
+            .unwrap()
+            .all()
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn put<T: native_db::ToInput>(db: &Database<'_>, item: T) {
+        let rw = db.rw_transaction().unwrap();
+        rw.upsert(item).unwrap();
+        rw.commit().unwrap();
+    }
+
+    /// A torrent as a search returns it
+    fn book() -> MaMTorrent {
+        MaMTorrent {
             id: 1,
             title: "Book".to_owned(),
             author_info: [(1, "Ann Author".to_owned())].into(),
@@ -642,7 +706,19 @@ mod tests {
             numfiles: 1,
             size: "100 MiB".to_owned(),
             ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hash_record_replaces_metadata_only_record() {
+        let store_by_hash = |db: &Database<'_>, record: mlm_db::Torrent| -> Result<()> {
+            let rw = db.rw_transaction()?;
+            upsert_hash_record(&rw, record)?;
+            rw.commit()?;
+            Ok(())
         };
+
+        let torrent = book();
         let meta = torrent.as_meta().unwrap();
         // A metadata only record, as stored for a torrent the account had already snatched
         let scratch = database();
@@ -654,7 +730,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut metadata_only = stored(&scratch).pop().unwrap();
+        let mut metadata_only = stored::<mlm_db::Torrent>(&scratch).pop().unwrap();
         metadata_only.goodreads_id = Some(5);
         let by_hash = mlm_db::Torrent {
             id: "hash".to_owned(),
@@ -667,7 +743,7 @@ mod tests {
         let db = database();
         put(&db, metadata_only.clone());
         store_by_hash(&db, by_hash.clone()).unwrap();
-        let records = stored(&db);
+        let records = stored::<mlm_db::Torrent>(&db);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id, "hash");
         assert_eq!(records[0].goodreads_id, Some(5));
@@ -682,7 +758,7 @@ mod tests {
             },
         );
         assert!(store_by_hash(&db, by_hash.clone()).is_err());
-        assert_eq!(stored(&db)[0].id, "other");
+        assert_eq!(stored::<mlm_db::Torrent>(&db)[0].id, "other");
 
         // So is a metadata only record with files
         let db = database();
@@ -694,7 +770,103 @@ mod tests {
             },
         );
         assert!(store_by_hash(&db, by_hash).is_err());
-        assert!(stored(&db)[0].library_path.is_some());
+        assert!(stored::<mlm_db::Torrent>(&db)[0].library_path.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_store_snatched() {
+        let torrent = book();
+        let meta = torrent.as_meta().unwrap();
+        let selection = SelectedTorrent {
+            mam_id: 1,
+            goodreads_id: None,
+            hash: None,
+            dl_link: "dl".to_owned(),
+            unsat_buffer: None,
+            wedge_buffer: None,
+            cost: TorrentCost::Ratio,
+            category: None,
+            tags: vec![],
+            title_search: "book".to_owned(),
+            meta,
+            grabber: None,
+            by_hand: false,
+            created_at: Timestamp::now(),
+            started_at: None,
+            removed_at: None,
+        };
+        let found = |mam_id, status| {
+            Some(mlm_db::ListItemTorrent {
+                mam_id,
+                status,
+                at: Timestamp::now(),
+            })
+        };
+        let list_item = |guid: &str, audio_torrent, ebook_torrent| mlm_db::ListItem {
+            guid: ("list".to_owned(), guid.to_owned()),
+            list_id: "list".to_owned(),
+            title: "Book".to_owned(),
+            authors: vec![],
+            series: vec![],
+            cover_url: String::new(),
+            book_url: None,
+            isbn: None,
+            prefer_format: None,
+            allow_audio: true,
+            audio_torrent,
+            allow_ebook: true,
+            ebook_torrent,
+            created_at: Timestamp::now(),
+            marked_done_at: None,
+        };
+        let status = |field: &Option<mlm_db::ListItemTorrent>| {
+            field.as_ref().map(|field| field.status.clone())
+        };
+
+        // The selection is replaced by a metadata only record, and the list items that selected
+        // it show it as found in the library
+        let db = database();
+        put(&db, selection.clone());
+        put(
+            &db,
+            list_item(
+                "a",
+                found(1, TorrentStatus::Selected),
+                found(2, TorrentStatus::Selected),
+            ),
+        );
+        put(&db, list_item("b", found(1, TorrentStatus::Wanted), None));
+        store_snatched(&db, selection.clone(), torrent.clone())
+            .await
+            .unwrap();
+        assert!(stored::<SelectedTorrent>(&db).is_empty());
+        let records = stored::<mlm_db::Torrent>(&db);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].mam_id, 1);
+        assert!(!records[0].id_is_hash);
+        assert!(records[0].library_path.is_none());
+        let items = stored::<mlm_db::ListItem>(&db);
+        let item = |guid: &str| items.iter().find(|item| item.guid.1 == guid).unwrap();
+        assert_eq!(
+            status(&item("a").audio_torrent),
+            Some(TorrentStatus::Existing)
+        );
+        assert_eq!(
+            status(&item("a").ebook_torrent),
+            Some(TorrentStatus::Selected)
+        );
+        assert_eq!(status(&item("b").audio_torrent), Some(TorrentStatus::Wanted));
+
+        // When MLM already has a record of the torrent, only the selection is removed
+        let db = database();
+        let record = records[0].clone();
+        put(&db, record.clone());
+        put(&db, selection.clone());
+        store_snatched(&db, selection, torrent).await.unwrap();
+        assert!(stored::<SelectedTorrent>(&db).is_empty());
+        let records = stored::<mlm_db::Torrent>(&db);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, record.id);
     }
 
     /// A torrent as MaM returns it: plain, free, personal freeleech, VIP, snatched, and free
@@ -733,26 +905,35 @@ mod tests {
     fn test_spend_wedge() {
         let [plain, free, personal, vip, snatched, free_snatched] = infos();
         for cost in [TorrentCost::UseWedge, TorrentCost::TryWedge] {
-            // The torrent is only looked up when there's a wedge to spend
-            assert!(needs_lookup(cost, 1, 0));
-            assert!(!needs_lookup(cost, 0, 0));
-            assert!(!needs_lookup(cost, 2, 2));
+            // A selection made by hand is only looked up when there's a wedge to spend
+            assert!(needs_lookup(cost, 1, 0, false));
+            assert!(!needs_lookup(cost, 0, 0, false));
+            assert!(!needs_lookup(cost, 2, 2, false));
 
-            assert_eq!(decide_spend(cost, 1, 0, Some(&plain)), Ok(Spend::Wedge));
-            assert_eq!(decide_spend(cost, 3, 2, Some(&plain)), Ok(Spend::Wedge));
-            // No wedge on torrents that are already free, `fl` would spend one on VIP too
-            for info in [&free, &personal, &vip, &free_snatched] {
-                assert_eq!(decide_spend(cost, 1, 0, Some(info)), Ok(Spend::Nothing));
+            for skip_snatched in [false, true] {
+                let spend = |wedges, wedge_buffer, info| {
+                    decide_spend(cost, wedges, wedge_buffer, skip_snatched, Some(info))
+                };
+                assert_eq!(spend(1, 0, &plain), Ok(Spend::Wedge));
+                assert_eq!(spend(3, 2, &plain), Ok(Spend::Wedge));
+                // No wedge on torrents that are already free, `fl` would spend one on VIP too
+                for info in [&free, &personal, &vip] {
+                    assert_eq!(spend(1, 0, info), Ok(Spend::Nothing));
+                }
             }
+            assert_eq!(
+                decide_spend(cost, 1, 0, false, Some(&free_snatched)),
+                Ok(Spend::Nothing)
+            );
         }
 
-        // No wedge either on a torrent that was already snatched, or that MaM doesn't return, or
-        // when wedges run out. wedge isn't grabbed then, try_wedge falls back to ratio
+        // By hand, no wedge either on a torrent that was already snatched, or that MaM doesn't
+        // return, or when wedges run out. wedge isn't grabbed then, try_wedge falls back to ratio
         let wedge = |wedges, wedge_buffer, info| {
-            decide_spend(TorrentCost::UseWedge, wedges, wedge_buffer, info)
+            decide_spend(TorrentCost::UseWedge, wedges, wedge_buffer, false, info)
         };
         let try_wedge = |wedges, wedge_buffer, info| {
-            decide_spend(TorrentCost::TryWedge, wedges, wedge_buffer, info)
+            decide_spend(TorrentCost::TryWedge, wedges, wedge_buffer, false, info)
         };
         assert_eq!(
             wedge(1, 0, Some(&snatched)),
@@ -775,9 +956,10 @@ mod tests {
     #[test]
     fn test_spend_without_wedge() {
         let [plain, free, personal, vip, snatched, free_snatched] = infos();
-        assert!(!needs_lookup(TorrentCost::Ratio, 1, 0));
+        // A ratio selection made by hand isn't looked up
+        assert!(!needs_lookup(TorrentCost::Ratio, 1, 0, false));
         assert_eq!(
-            decide_spend(TorrentCost::Ratio, 1, 0, None),
+            decide_spend(TorrentCost::Ratio, 1, 0, false, None),
             Ok(Spend::Ratio)
         );
 
@@ -786,20 +968,84 @@ mod tests {
             TorrentCost::PersonalFreeleech,
             TorrentCost::Vip,
         ] {
-            // Free costs are checked before the torrent file is downloaded, wedges or not
-            assert!(needs_lookup(cost, 1, 0));
-            assert!(needs_lookup(cost, 0, 0));
-            for info in [&free, &personal, &vip, &free_snatched] {
-                assert_eq!(decide_spend(cost, 0, 0, Some(info)), Ok(Spend::Nothing));
+            for skip_snatched in [false, true] {
+                // Free costs are checked before the torrent file is downloaded, wedges or not
+                assert!(needs_lookup(cost, 1, 0, skip_snatched));
+                assert!(needs_lookup(cost, 0, 0, skip_snatched));
+                let spend =
+                    |wedges, info| decide_spend(cost, wedges, 0, skip_snatched, info);
+                for info in [&free, &personal, &vip] {
+                    assert_eq!(spend(0, Some(info)), Ok(Spend::Nothing));
+                }
+                assert_eq!(spend(1, Some(&plain)), Err(NotGrabbed::NoLongerFree(cost)));
+                assert_eq!(spend(1, None), Err(NotGrabbed::NotOnMam));
             }
-            for info in [&plain, &snatched] {
-                assert_eq!(
-                    decide_spend(cost, 1, 0, Some(info)),
-                    Err(NotGrabbed::NoLongerFree(cost))
-                );
-            }
-            assert_eq!(decide_spend(cost, 1, 0, None), Err(NotGrabbed::NotOnMam));
+            assert_eq!(
+                decide_spend(cost, 0, 0, false, Some(&free_snatched)),
+                Ok(Spend::Nothing)
+            );
+            assert_eq!(
+                decide_spend(cost, 1, 0, false, Some(&snatched)),
+                Err(NotGrabbed::NoLongerFree(cost))
+            );
         }
+    }
+
+    #[test]
+    fn test_skip_snatched() {
+        let [plain, free, _, _, snatched, free_snatched] = infos();
+        for cost in [
+            TorrentCost::GlobalFreeleech,
+            TorrentCost::PersonalFreeleech,
+            TorrentCost::Vip,
+            TorrentCost::UseWedge,
+            TorrentCost::TryWedge,
+            TorrentCost::Ratio,
+        ] {
+            for (wedges, wedge_buffer) in [(0, 0), (1, 0), (2, 2), (3, 2)] {
+                // Every selection that can be downloaded is looked up. A wedge selection isn't
+                // downloaded without enough wedges
+                let can_download = cost != TorrentCost::UseWedge || wedges > wedge_buffer;
+                assert_eq!(
+                    needs_lookup(cost, wedges, wedge_buffer, true),
+                    can_download,
+                    "{cost:?}, {wedges} wedges, buffer {wedge_buffer}"
+                );
+                // It isn't grabbed once the account snatched it, whatever it costs now
+                if can_download {
+                    for info in [&snatched, &free_snatched] {
+                        assert_eq!(
+                            decide_spend(cost, wedges, wedge_buffer, true, Some(info)),
+                            Err(NotGrabbed::SkippedSnatched),
+                            "{cost:?}, {wedges} wedges, buffer {wedge_buffer}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // The new lookups change nothing else: ratio and try_wedge without enough wedges still
+        // download on ratio, even when MaM doesn't return the torrent
+        for info in [Some(&plain), Some(&free), None] {
+            assert_eq!(
+                decide_spend(TorrentCost::Ratio, 1, 0, true, info),
+                Ok(Spend::Ratio)
+            );
+            assert_eq!(
+                decide_spend(TorrentCost::TryWedge, 2, 2, true, info),
+                Ok(Spend::Ratio)
+            );
+        }
+
+        // A selection made by hand is grabbed anyway
+        assert_eq!(
+            decide_spend(TorrentCost::Ratio, 1, 0, false, Some(&snatched)),
+            Ok(Spend::Ratio)
+        );
+        assert_eq!(
+            decide_spend(TorrentCost::Vip, 1, 0, false, Some(&free_snatched)),
+            Ok(Spend::Nothing)
+        );
     }
 
     #[test]
@@ -814,17 +1060,21 @@ mod tests {
             TorrentCost::PersonalFreeleech,
             TorrentCost::Vip,
         ] {
-            assert_eq!(
-                decide_spend(cost, 1, 0, Some(&vip_only)),
-                Err(NotGrabbed::NoLongerFree(cost))
-            );
+            for skip_snatched in [false, true] {
+                assert_eq!(
+                    decide_spend(cost, 1, 0, skip_snatched, Some(&vip_only)),
+                    Err(NotGrabbed::NoLongerFree(cost))
+                );
+            }
         }
         // But no wedge is used on it, since `fl` spends one even on VIP torrents
         for cost in [TorrentCost::UseWedge, TorrentCost::TryWedge] {
-            assert_eq!(
-                decide_spend(cost, 1, 0, Some(&vip_only)),
-                Ok(Spend::Nothing)
-            );
+            for skip_snatched in [false, true] {
+                assert_eq!(
+                    decide_spend(cost, 1, 0, skip_snatched, Some(&vip_only)),
+                    Ok(Spend::Nothing)
+                );
+            }
         }
     }
 
@@ -841,12 +1091,14 @@ mod tests {
             TorrentCost::Ratio,
         ] {
             for (wedges, wedge_buffer) in [(0, 0), (1, 0), (2, 2), (3, 2)] {
-                if !needs_lookup(cost, wedges, wedge_buffer) {
-                    assert_ne!(
-                        decide_spend(cost, wedges, wedge_buffer, None),
-                        Err(NotGrabbed::NotOnMam),
-                        "{cost:?}, {wedges} wedges, buffer {wedge_buffer}"
-                    );
+                for skip_snatched in [false, true] {
+                    if !needs_lookup(cost, wedges, wedge_buffer, skip_snatched) {
+                        assert_ne!(
+                            decide_spend(cost, wedges, wedge_buffer, skip_snatched, None),
+                            Err(NotGrabbed::NotOnMam),
+                            "{cost:?}, {wedges} wedges, buffer {wedge_buffer}, {skip_snatched}"
+                        );
+                    }
                 }
             }
         }

@@ -1,4 +1,4 @@
-use super::{v03, v04, v08, v09, v10, v11, v12, v13, v15, v16};
+use super::{v03, v04, v08, v09, v10, v11, v12, v13, v15, v16, v18};
 use mlm_parse::{normalize_title, parse_edition};
 use native_db::{ToKey, native_db};
 use native_model::{Model, native_model};
@@ -210,6 +210,28 @@ impl From<v16::SelectedTorrent> for SelectedTorrent {
             tags: t.tags,
             title_search: normalize_title(&meta.title),
             meta,
+            grabber: t.grabber,
+            created_at: t.created_at,
+            started_at: t.started_at,
+            removed_at: t.removed_at,
+        }
+    }
+}
+
+impl From<v18::SelectedTorrent> for SelectedTorrent {
+    fn from(t: v18::SelectedTorrent) -> Self {
+        Self {
+            mam_id: t.mam_id,
+            goodreads_id: t.goodreads_id,
+            hash: t.hash,
+            dl_link: t.dl_link,
+            unsat_buffer: t.unsat_buffer,
+            wedge_buffer: t.wedge_buffer,
+            cost: t.cost,
+            category: t.category,
+            tags: t.tags,
+            title_search: t.title_search,
+            meta: t.meta,
             grabber: t.grabber,
             created_at: t.created_at,
             started_at: t.started_at,

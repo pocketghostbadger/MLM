@@ -7,7 +7,8 @@ use anyhow::{Context, Result};
 use itertools::Itertools;
 use matchr::score;
 use mlm_db::{
-    Flags, ListItem, ListItemTorrent, OldMainCat, Torrent, TorrentKey, TorrentMeta, TorrentStatus,
+    Flags, ListItem, ListItemTorrent, OldMainCat, Timestamp, Torrent, TorrentKey, TorrentMeta,
+    TorrentStatus,
 };
 use mlm_mam::{
     api::MaM,
@@ -16,7 +17,7 @@ use mlm_mam::{
     serde::{DATE_FORMAT, DATE_TIME_FORMAT},
 };
 use mlm_parse::normalize_title;
-use native_db::Database;
+use native_db::{Database, transaction::RwTransaction};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
@@ -183,6 +184,33 @@ fn set_existing(field: &mut Option<ListItemTorrent>, torrent: &Torrent) -> bool 
         at: torrent.created_at,
     });
     true
+}
+
+/// Shows a selected torrent that the downloader skipped because the account already snatched it
+/// as found in the library, on the list items that selected it
+pub fn mark_snatched_existing(rw: &RwTransaction<'_>, mam_id: u64) -> Result<()> {
+    let items = rw
+        .scan()
+        .primary::<ListItem>()?
+        .all()?
+        .collect::<Result<Vec<_>, _>>()?;
+    for mut item in items {
+        let mut updated = false;
+        for field in [&mut item.audio_torrent, &mut item.ebook_torrent]
+            .into_iter()
+            .flatten()
+        {
+            if field.mam_id == mam_id && field.status == TorrentStatus::Selected {
+                field.status = TorrentStatus::Existing;
+                field.at = Timestamp::now();
+                updated = true;
+            }
+        }
+        if updated {
+            rw.upsert(item)?;
+        }
+    }
+    Ok(())
 }
 
 /// Results per search page, the search endpoint allows 5 to 1000
