@@ -135,10 +135,18 @@
       <button name=action value=torrent-stop>stop</button>
     {% endmatch %}
   </form>
-  <form method=post class=row style="justify-content:flex-start">
+  <form method=post class=row style="justify-content:flex-start" autocomplete=off>
+    <input type=hidden name=loaded value=1>
+    <input type=hidden name=loaded_category value="{{ qbit.torrent.category }}">
     Category: <select name=category>
+      {% if qbit.torrent.category.is_empty() %}
+        <option value="" selected>(none)</option>
+      {% endif %}
+      {% if !qbit.category_listed %}
+        <option value="{{ qbit.torrent.category }}" selected>{{ qbit.torrent.category }}</option>
+      {% endif %}
       {% for cat in qbit.categories %}
-        <option {% if &cat.name == &qbit.torrent.category %}selected{% endif %}>{{ cat.name }}</option>
+        <option value="{{ cat.name }}" {% if &cat.name == &qbit.torrent.category %}selected{% endif %}>{{ cat.name }}</option>
       {% endfor %}
     </select>
     Tags: <div class=option_group>
@@ -147,6 +155,7 @@
           {{ tag }}
           <input type=checkbox name=tags {% if qbit.torrent_tags.contains(tag.as_str()) %}checked{% endif %} value="{{tag}}">
         </label>
+        {% if qbit.torrent_tags.contains(tag.as_str()) %}<input type=hidden name=loaded_tags value="{{tag}}">{% endif %}
       {% endfor %}
     </div>
     <button type=submit name=action value=qbit>save</button>

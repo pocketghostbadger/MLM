@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, ops::Deref, path::PathBuf};
+use std::{collections::BTreeSet, path::PathBuf};
 
 use anyhow::Result;
 use askama::Template;
@@ -210,7 +210,9 @@ async fn torrent_page_id(
         });
 
         qbit_data = Some(QbitData {
-            torrent_tags: qbit_torrent.tags.split(", ").map(str::to_string).collect(),
+            torrent_tags: split_tags(&qbit_torrent.tags).map(str::to_string).collect(),
+            category_listed: qbit_torrent.category.is_empty()
+                || categories.iter().any(|cat| cat.name == qbit_torrent.category),
             torrent: qbit_torrent,
             trackers,
             categories,
@@ -366,37 +368,32 @@ pub async fn torrent_page_post_id(
                 return Err(anyhow::Error::msg("Could not find torrent").into());
             };
 
-            ensure_category_exists(&qbit, &qbit_conf.url, &form.category).await?;
-            qbit.set_category(Some(vec![&id]), &form.category).await?;
-            let mut torrent_tags = torrent.tags.split(", ").collect::<BTreeSet<&str>>();
-            if torrent.tags.is_empty() {
-                torrent_tags.clear();
+            // A page opened before the loaded fields existed is compared with the torrent as it
+            // is now.
+            let loaded = form.loaded.is_some();
+            let loaded_category = if loaded {
+                &form.loaded_category
+            } else {
+                &torrent.category
+            };
+            if category_changed(&form.category, loaded_category, &torrent.category) {
+                ensure_category_exists(&qbit, &qbit_conf.url, &form.category).await?;
+                qbit.set_category(Some(vec![&id]), &form.category).await?;
             }
-            if !form.tags.is_empty() {
-                let mut add_tags = form
-                    .tags
-                    .iter()
-                    .map(|tag| tag.as_str())
-                    .collect::<BTreeSet<&str>>();
-                for tag in &torrent_tags {
-                    add_tags.remove(tag);
-                }
-                if !add_tags.is_empty() {
-                    println!("add tags {:?}", add_tags);
-                    qbit.add_tags(Some(vec![&id]), add_tags.into_iter().collect())
-                        .await?;
-                }
+            let (add_tags, remove_tags) = tag_changes(
+                &torrent.tags,
+                loaded.then_some(form.loaded_tags.as_slice()),
+                &form.tags,
+            );
+            if !add_tags.is_empty() {
+                println!("add tags {:?}", add_tags);
+                qbit.add_tags(Some(vec![&id]), add_tags.into_iter().collect())
+                    .await?;
             }
-            for tag in &form.tags {
-                torrent_tags.remove(tag.as_str());
-            }
-            if !torrent_tags.is_empty() {
-                println!("remove tags {torrent_tags:?}");
-                qbit.remove_tags(
-                    Some(vec![&id]),
-                    form.tags.iter().map(Deref::deref).collect(),
-                )
-                .await?;
+            if !remove_tags.is_empty() {
+                println!("remove tags {remove_tags:?}");
+                qbit.remove_tags(Some(vec![&id]), remove_tags.into_iter().collect())
+                    .await?;
             }
         }
         "remove-torrent" => {
@@ -427,8 +424,15 @@ pub struct TorrentPageForm {
     action: String,
     #[serde(default)]
     category: String,
+    /// Set by pages that send loaded_category and loaded_tags: the torrent's category and tags
+    /// when the page loaded.
+    loaded: Option<String>,
+    #[serde(default)]
+    loaded_category: String,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    loaded_tags: Vec<String>,
     mam_id: Option<u64>,
 }
 
@@ -486,6 +490,7 @@ struct QbitData {
     categories: Vec<Category>,
     tags: Vec<String>,
     torrent_tags: BTreeSet<String>,
+    category_listed: bool,
 }
 
 #[allow(unused)]
@@ -578,4 +583,205 @@ async fn other_torrents(
         config: config.search.clone(),
         torrents,
     })
+}
+
+/// Splits a qBittorrent tag list, joined by ", ".
+fn split_tags(tags: &str) -> impl Iterator<Item = &str> {
+    tags.split(", ").filter(|tag| !tag.is_empty())
+}
+
+/// Whether saving the torrent page changes the torrent's category: only if the user `picked`
+/// another one than the page showed (`loaded`), so a category set elsewhere in the meantime
+/// stays. The page doesn't clear a category: "(none)" is only offered for a torrent without one.
+fn category_changed(picked: &str, loaded: &str, current: &str) -> bool {
+    !picked.is_empty() && picked != loaded && picked != current
+}
+
+/// Returns the tags to add to and remove from a torrent when the torrent page is saved. Only the
+/// tags the user checked or unchecked change: `loaded` are the torrent's tags when the page
+/// loaded, `checked` the tags checked on save and `current` the torrent's tags now, so a tag
+/// added or removed elsewhere in the meantime is left as it is. Without `loaded`, the checked
+/// tags are compared with `current`.
+fn tag_changes<'a>(
+    current: &'a str,
+    loaded: Option<&'a [String]>,
+    checked: &'a [String],
+) -> (BTreeSet<&'a str>, BTreeSet<&'a str>) {
+    let current = split_tags(current).collect::<BTreeSet<&str>>();
+    let loaded = match loaded {
+        Some(loaded) => loaded.iter().map(String::as_str).collect::<BTreeSet<&str>>(),
+        None => current.clone(),
+    };
+    let checked = checked.iter().map(String::as_str).collect::<BTreeSet<&str>>();
+    let add = checked
+        .difference(&loaded)
+        .filter(|tag| !current.contains(*tag))
+        .copied()
+        .collect();
+    let remove = loaded
+        .difference(&checked)
+        .filter(|tag| current.contains(*tag))
+        .copied()
+        .collect();
+    (add, remove)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tags(tags: &[&str]) -> Vec<String> {
+        tags.iter().map(|tag| tag.to_string()).collect()
+    }
+
+    fn set<'a>(tags: &[&'a str]) -> BTreeSet<&'a str> {
+        tags.iter().copied().collect()
+    }
+
+    #[test]
+    fn unchecking_a_tag_removes_only_that_tag() {
+        let loaded = tags(&["a", "b", "c"]);
+        let checked = tags(&["a", "c"]);
+        let (add, remove) = tag_changes("a, b, c", Some(&loaded[..]), &checked);
+        assert_eq!(add, set(&[]));
+        assert_eq!(remove, set(&["b"]));
+    }
+
+    #[test]
+    fn checking_a_tag_adds_only_that_tag() {
+        let loaded = tags(&["a"]);
+        let checked = tags(&["a", "b"]);
+        let (add, remove) = tag_changes("a", Some(&loaded[..]), &checked);
+        assert_eq!(add, set(&["b"]));
+        assert_eq!(remove, set(&[]));
+    }
+
+    #[test]
+    fn checking_and_unchecking_at_once() {
+        let loaded = tags(&["a", "b"]);
+        let checked = tags(&["b", "c"]);
+        let (add, remove) = tag_changes("a, b", Some(&loaded[..]), &checked);
+        assert_eq!(add, set(&["c"]));
+        assert_eq!(remove, set(&["a"]));
+    }
+
+    #[test]
+    fn unchecking_every_tag_removes_them_all() {
+        let loaded = tags(&["a", "b"]);
+        let (add, remove) = tag_changes("a, b", Some(&loaded[..]), &[]);
+        assert_eq!(add, set(&[]));
+        assert_eq!(remove, set(&["a", "b"]));
+    }
+
+    #[test]
+    fn keeps_tags_added_after_the_page_loaded() {
+        let loaded = tags(&["a", "b"]);
+        let checked = tags(&["a"]);
+        let (add, remove) = tag_changes("a, b, x", Some(&loaded[..]), &checked);
+        assert_eq!(add, set(&[]));
+        assert_eq!(remove, set(&["b"]));
+    }
+
+    #[test]
+    fn does_not_add_back_tags_removed_after_the_page_loaded() {
+        let loaded = tags(&["a", "b"]);
+        let checked = tags(&["a", "b"]);
+        let (add, remove) = tag_changes("a", Some(&loaded[..]), &checked);
+        assert_eq!(add, set(&[]));
+        assert_eq!(remove, set(&[]));
+    }
+
+    #[test]
+    fn skips_changes_already_made_elsewhere() {
+        let loaded = tags(&["a"]);
+        let checked = tags(&["b"]);
+        let (add, remove) = tag_changes("b", Some(&loaded[..]), &checked);
+        assert_eq!(add, set(&[]));
+        assert_eq!(remove, set(&[]));
+    }
+
+    #[test]
+    fn torrent_without_tags() {
+        let (add, remove) = tag_changes("", Some(&[][..]), &[]);
+        assert_eq!(add, set(&[]));
+        assert_eq!(remove, set(&[]));
+
+        let checked = tags(&["a"]);
+        let (add, remove) = tag_changes("", Some(&[][..]), &checked);
+        assert_eq!(add, set(&["a"]));
+        assert_eq!(remove, set(&[]));
+    }
+
+    #[test]
+    fn unchanged_tags() {
+        let loaded = tags(&["a", "b"]);
+        let checked = tags(&["a", "b"]);
+        let (add, remove) = tag_changes("a, b", Some(&loaded[..]), &checked);
+        assert_eq!(add, set(&[]));
+        assert_eq!(remove, set(&[]));
+    }
+
+    #[test]
+    fn without_loaded_tags_compares_with_current_tags() {
+        let checked = tags(&["a", "c"]);
+        let (add, remove) = tag_changes("a, b", None, &checked);
+        assert_eq!(add, set(&["c"]));
+        assert_eq!(remove, set(&["b"]));
+    }
+
+    #[test]
+    fn split_tags_skips_empty_list() {
+        assert_eq!(split_tags("").count(), 0);
+        assert_eq!(split_tags("a, b").collect::<Vec<_>>(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn category_changes_only_when_picked() {
+        assert!(!category_changed("books", "books", "books"));
+        assert!(category_changed("audio", "books", "books"));
+        assert!(category_changed("books", "", ""));
+        // The page only offers "(none)" for a torrent without a category, so never clears one.
+        assert!(!category_changed("", "books", "books"));
+        // Set elsewhere after the page loaded.
+        assert!(!category_changed("", "", "books"));
+        assert!(!category_changed("books", "books", "audio"));
+    }
+
+    async fn parse_form(body: &'static str) -> TorrentPageForm {
+        use axum::{body::Body, extract::FromRequest, http::Request};
+        let request = Request::post("/")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+        let Form(form) = Form::<TorrentPageForm>::from_request(request, &())
+            .await
+            .unwrap();
+        form
+    }
+
+    #[tokio::test]
+    async fn parses_page_without_category_or_tags() {
+        let form = parse_form("loaded=1&loaded_category=&category=&action=qbit").await;
+        assert!(form.loaded.is_some());
+        assert_eq!(form.loaded_category, "");
+        assert!(form.loaded_tags.is_empty());
+        assert!(form.tags.is_empty());
+    }
+
+    #[tokio::test]
+    async fn parses_repeated_tags() {
+        let form = parse_form(
+            "loaded=1&loaded_category=books&category=books&tags=a&tags=b&loaded_tags=a&loaded_tags=c&action=qbit",
+        )
+        .await;
+        assert_eq!(form.loaded_category, "books");
+        assert_eq!(form.tags, tags(&["a", "b"]));
+        assert_eq!(form.loaded_tags, tags(&["a", "c"]));
+    }
+
+    #[tokio::test]
+    async fn parses_page_from_before_loaded_fields() {
+        let form = parse_form("category=books&tags=a&action=qbit").await;
+        assert!(form.loaded.is_none());
+    }
 }
