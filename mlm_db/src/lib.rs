@@ -16,6 +16,7 @@ mod v14;
 mod v15;
 mod v16;
 mod v17;
+mod v18;
 
 use std::collections::HashMap;
 
@@ -32,6 +33,8 @@ use tracing::{info, instrument};
 pub static MODELS: Lazy<Models> = Lazy::new(|| {
     let mut models = Models::new();
     models.define::<v01::Config>().unwrap();
+
+    models.define::<v18::SelectedTorrent>().unwrap();
 
     models.define::<v17::Torrent>().unwrap();
     models.define::<v17::SelectedTorrent>().unwrap();
@@ -132,8 +135,8 @@ pub static MODELS: Lazy<Models> = Lazy::new(|| {
 pub type Config = v01::Config;
 pub type Torrent = v17::Torrent;
 pub type TorrentKey = v17::TorrentKey;
-pub type SelectedTorrent = v17::SelectedTorrent;
-pub type SelectedTorrentKey = v17::SelectedTorrentKey;
+pub type SelectedTorrent = v18::SelectedTorrent;
+pub type SelectedTorrentKey = v18::SelectedTorrentKey;
 pub type DuplicateTorrent = v17::DuplicateTorrent;
 pub type ErroredTorrent = v17::ErroredTorrent;
 pub type ErroredTorrentKey = v17::ErroredTorrentKey;

@@ -631,6 +631,7 @@ pub async fn select_torrents<T: Iterator<Item = MaMTorrent>>(
                 title_search,
                 meta,
                 grabber: grabber.name.clone(),
+                by_hand: false,
                 created_at: Timestamp::now(),
                 started_at: None,
                 removed_at: None,

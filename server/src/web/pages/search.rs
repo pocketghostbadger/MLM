@@ -163,6 +163,7 @@ pub async fn select_torrent(context: &Context, mam_id: u64, wedge: bool) -> Resu
             title_search: normalize_title(&meta.title),
             meta,
             grabber: None,
+            by_hand: true,
             created_at: Timestamp::now(),
             started_at: None,
             removed_at: None,
