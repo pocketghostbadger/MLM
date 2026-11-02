@@ -10,6 +10,7 @@ mod ebook_links;
 mod exporter;
 mod linker;
 mod lists;
+mod log_files;
 mod logging;
 mod qbittorrent;
 mod stats;
@@ -49,7 +50,6 @@ use tokio::{
 };
 use torrent_downloader::grab_selected_torrents;
 use tracing::{error, warn};
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{
     EnvFilter, Layer as _, fmt::time::LocalTime, layer::SubscriberExt as _,
     util::SubscriberInitExt as _,
@@ -98,6 +98,13 @@ async fn app_main() -> Result<()> {
                     .unwrap_or_else(|| "logs".into()),
             )
         });
+    let file_filter =
+        log_files::file_filter(env::var("MLM_LOG_FILE").ok(), env::var("MLM_LOG").ok());
+    // Without a log folder there's nothing to cap, so a bad value only stops MLM when it would be used
+    let max_log_files = match log_dir {
+        Some(_) => log_files::parse_max_files(env::var("MLM_LOG_MAX_FILES"))?,
+        None => None,
+    };
 
     let stderr_layer = tracing_subscriber::fmt::layer()
         .pretty()
@@ -107,13 +114,9 @@ async fn app_main() -> Result<()> {
         .as_ref()
         .map(|log_dir| {
             Result::<_, anyhow::Error>::Ok(
-                tracing_subscriber::fmt::layer().pretty().with_writer(
-                    RollingFileAppender::builder()
-                        .rotation(Rotation::DAILY)
-                        .filename_prefix("mlm")
-                        .filename_suffix("log")
-                        .build(log_dir)?,
-                ),
+                tracing_subscriber::fmt::layer()
+                    .pretty()
+                    .with_writer(log_files::appender(log_dir)?),
             )
         })
         .transpose()?;
@@ -134,11 +137,13 @@ async fn app_main() -> Result<()> {
                 .with_filter(
                     EnvFilter::builder()
                         .with_default_directive("mlm=debug".parse().unwrap())
-                        .with_env_var("MLM_LOG")
-                        .from_env_lossy(),
+                        .parse_lossy(file_filter),
                 )
         }))
         .try_init()?;
+    if let (Some(log_dir), Some(max_files)) = (log_dir.clone(), max_log_files) {
+        log_files::spawn_pruner(log_dir, max_files)?;
+    }
     #[cfg(target_family = "windows")]
     std::panic::set_hook(Box::new(tracing_panic::panic_hook));
 
