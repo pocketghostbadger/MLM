@@ -25,4 +25,6 @@ For each book MLM tells you what it did:
 - *Found matching … in library* – you already have it.
 - *Audiobook missing* / *Ebook missing* – nothing suitable has been found yet.
 
+If MLM drops a torrent that a list selected before downloading it, because it's no longer freeleech or no longer on MyAnonamouse, that format of the book shows as missing again and can be found on a later import.
+
 Each book also has a **search on MaM** link, a **goodreads** link and a link to the torrent that was found. If you decide you don't want a missing book after all, press **mark done** and MLM stops looking for it.

@@ -15,6 +15,8 @@ Above the table you can see your MyAnonamouse standing:
 
 Choose extra columns with **Columns**. Besides the title and type, you see the **Cost** (how the torrent will be paid for) and **Required Unsats**. The latter is the number of free unsat slots MLM wants to keep before it downloads this torrent.
 
+A torrent picked by a `ratio` (`all`) or `try_wedge` block shows that cost even when it's freeleech, since it's downloaded either way. One picked as freeleech or VIP by a `free` or `wedge` block is only downloaded while it's still free; when it isn't, MLM drops it, and a later search can select it again as its block allows.
+
 ## Actions
 
 Tick one or more torrents and these buttons appear:
