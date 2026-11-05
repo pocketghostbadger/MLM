@@ -189,6 +189,26 @@ fn set_existing(field: &mut Option<ListItemTorrent>, torrent: &Torrent) -> bool 
 /// Shows a selected torrent that the downloader skipped because the account already snatched it
 /// as found in the library, on the list items that selected it
 pub fn mark_snatched_existing(rw: &RwTransaction<'_>, mam_id: u64) -> Result<()> {
+    update_selected_items(rw, mam_id, |field| {
+        if let Some(field) = field {
+            field.status = TorrentStatus::Existing;
+            field.at = Timestamp::now();
+        }
+    })
+}
+
+/// Takes a selected torrent that the downloader dropped off the list items that selected it, so
+/// the next import searches for that format of the book as if it hadn't been found yet
+pub fn clear_dropped_selection(rw: &RwTransaction<'_>, mam_id: u64) -> Result<()> {
+    update_selected_items(rw, mam_id, |field| *field = None)
+}
+
+/// Changes the audiobook or ebook torrent of every list item that shows `mam_id` as selected
+fn update_selected_items(
+    rw: &RwTransaction<'_>,
+    mam_id: u64,
+    change: impl Fn(&mut Option<ListItemTorrent>),
+) -> Result<()> {
     let items = rw
         .scan()
         .primary::<ListItem>()?
@@ -196,13 +216,12 @@ pub fn mark_snatched_existing(rw: &RwTransaction<'_>, mam_id: u64) -> Result<()>
         .collect::<Result<Vec<_>, _>>()?;
     for mut item in items {
         let mut updated = false;
-        for field in [&mut item.audio_torrent, &mut item.ebook_torrent]
-            .into_iter()
-            .flatten()
-        {
-            if field.mam_id == mam_id && field.status == TorrentStatus::Selected {
-                field.status = TorrentStatus::Existing;
-                field.at = Timestamp::now();
+        for field in [&mut item.audio_torrent, &mut item.ebook_torrent] {
+            if field
+                .as_ref()
+                .is_some_and(|t| t.mam_id == mam_id && t.status == TorrentStatus::Selected)
+            {
+                change(field);
                 updated = true;
             }
         }

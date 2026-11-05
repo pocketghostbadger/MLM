@@ -18,7 +18,7 @@ use tokio::time::sleep;
 use tracing::{debug, instrument, trace, warn};
 
 use crate::{
-    autograbber::select_torrents,
+    autograbber::{select_torrents, vip_not_free},
     backoff::Backoff,
     config::{Config, Cost, GoodreadsList, Grab},
     lists::{search_grabs, search_library},
@@ -676,7 +676,7 @@ fn select_torrent(
         .iter()
         .flatten()
         .filter(|t| t.1.media_type.matches(main_cat.into()))
-        .find(|t| t.3.cost != Cost::Free || t.0.is_free())
+        .find(|t| (t.3.cost != Cost::Free || t.0.is_free()) && !vip_not_free(&t.0))
         .or_else(|| {
             torrents
                 .iter()
@@ -730,8 +730,11 @@ fn check_cost(
     field: &mut Option<ListItemTorrent>,
     selected: &mut Option<&(MaMTorrent, TorrentMeta, usize, Grab)>,
 ) -> bool {
-    let take =
-        selected.is_some_and(|selected| selected.3.cost == Cost::Free && !selected.0.is_free());
+    // A VIP torrent without a free flag isn't selected by any block, so it's wanted too, rather
+    // than left as selected with nothing selected
+    let take = selected.is_some_and(|selected| {
+        (selected.3.cost == Cost::Free && !selected.0.is_free()) || vip_not_free(&selected.0)
+    });
     if take {
         let found = selected.take().unwrap();
         warn!("Skipped {:?} torrent as it is not free", found.1.main_cat);
@@ -956,6 +959,41 @@ mod tests {
             select(&torrents, audio),
             (None, Some((2, TorrentStatus::Wanted)))
         );
+    }
+
+    #[test]
+    fn test_select_passes_over_vip_without_free_flag() {
+        let item = list_item("The Example Book", &["Ann Author"]);
+        let grabs = grabs(AUDIOBOOK_GRABS);
+        let vip_only = |id, size| MaMTorrent {
+            vip: true,
+            ..audiobook(id, "The Example Book", "Ann Author", size, false)
+        };
+        let audio = OldMainCat::Audio;
+
+        // Another upload is taken instead, whichever block matches it
+        let other = audiobook(2, "The Example Book", "Ann Author", "200 MiB", false);
+        let torrents = block_matches(&item, &grabs, &[vip_only(1, "200 MiB"), other]);
+        assert_eq!(ids(&torrents[0]), vec![1, 2]);
+        assert_eq!(select(&torrents, audio), (Some((2, Cost::Ratio)), None));
+
+        // When it's the only one, the book is wanted rather than shown as selected, since no
+        // block selects it
+        for size in ["200 MiB", "600 MiB"] {
+            let torrents = block_matches(&item, &grabs, &[vip_only(1, size)]);
+            assert_eq!(
+                select(&torrents, audio),
+                (None, Some((1, TorrentStatus::Wanted)))
+            );
+        }
+
+        // With a free flag it's selected as usual
+        let fl_vip = MaMTorrent {
+            fl_vip: true,
+            ..vip_only(1, "200 MiB")
+        };
+        let torrents = block_matches(&item, &grabs, &[fl_vip]);
+        assert_eq!(select(&torrents, audio), (Some((1, Cost::Ratio)), None));
     }
 
     #[test]
