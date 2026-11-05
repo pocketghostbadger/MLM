@@ -60,6 +60,7 @@ dry_run = true # this makes MLM not actually download the selected torrents, onl
 
 [[goodreads_list]]
 url = "https://www.goodreads.com/review/list/...?shelf=to-read" # A Goodreads bookshelf page, or an old list_rss feed URL
+search_stored_books = false # true also searches the books outside the newest 100 of the shelf, see the Goodreads docs
 
 [[goodreads_list.grab]] # A block deciding what torrents to grab from the list, if a torrent matches multiple block the first one is used
 cost = "all"

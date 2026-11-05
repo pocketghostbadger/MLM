@@ -147,6 +147,10 @@ pub struct GoodreadsList {
     #[serde(deserialize_with = "parse_opt")]
     pub prefer_format: Option<OldDbMainCat>,
     pub grab: Vec<Grab>,
+    /// Also search for the list's stored books that weren't in the fetched shelf, such as books
+    /// pushed out of the newest 100
+    #[serde(default)]
+    pub search_stored_books: bool,
 
     pub search_interval: Option<u64>,
     pub unsat_buffer: Option<u64>,
