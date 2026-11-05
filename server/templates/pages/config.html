@@ -118,6 +118,9 @@
     {% if let Some(wedge_buffer) = list.wedge_buffer %}
     <span class=key>wedge_buffer</span> = <span class=num>{{ wedge_buffer }}</span><br>
     {% endif %}
+    {% if list.search_stored_books %}
+    <span class=key>search_stored_books</span> = <span class=num>{{ list.search_stored_books }}</span><br>
+    {% endif %}
     {% if list.dry_run %}
     <span class=key>dry_run</span> = <span class=num>{{ list.dry_run }}</span><br>
     {% endif %}

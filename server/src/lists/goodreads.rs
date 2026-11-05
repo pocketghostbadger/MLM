@@ -1,12 +1,16 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use mlm_db::{
-    DatabaseExt as _, List, ListItem, ListItemTorrent, OldDbMainCat, OldMainCat, Timestamp,
-    TorrentMeta, TorrentStatus,
+    DatabaseExt as _, List, ListItem, ListItemKey, ListItemTorrent, OldDbMainCat, OldMainCat,
+    Timestamp, TorrentMeta, TorrentStatus,
 };
-use mlm_mam::{api::MaM, search::MaMTorrent};
+use mlm_mam::{
+    api::{MaM, refused_or_paused},
+    search::MaMTorrent,
+};
 use mlm_parse::clean_value;
 use native_db::Database;
 use once_cell::sync::Lazy;
@@ -27,8 +31,8 @@ use crate::{
 pub static SERIES_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(.*?) \(([^)]*?),? #?(\d+(?:\.\d+)?)\)$").unwrap());
 
-/// Books whose searches keep finding nothing wait 2 hours before the next search, then twice as
-/// long each time, up to a day. Keyed by list item guid
+/// Books whose searches keep finding nothing, or for stored books keep failing, wait 2 hours before
+/// the next search, then twice as long each time, up to a day. Keyed by list item guid
 static IMPORT_MUTEX: tokio::sync::Mutex<Backoff<(String, String)>> =
     tokio::sync::Mutex::const_new(Backoff::new(
         Duration::from_secs(2 * 60 * 60),
@@ -79,6 +83,20 @@ pub async fn run_goodreads_import(
         }
     }
 
+    let fetched: BTreeSet<String> = rss
+        .channel
+        .items
+        .iter()
+        .map(|item| item.guid.clone())
+        .collect();
+    let fetched_books: BTreeSet<u64> = rss
+        .channel
+        .items
+        .iter()
+        .filter_map(|item| item.book_id)
+        .collect();
+    let shelf_size = rss.channel.entries.unwrap_or(rss.channel.items.len());
+
     for mut item in rss.channel.items.into_iter() {
         if let Ok(title) = clean_value(&item.title) {
             item.title = title;
@@ -98,17 +116,13 @@ pub async fn run_goodreads_import(
             .get()
             .primary::<ListItem>((list_id.clone(), item.guid.clone()))?
         {
-            Some(mut db_item) => {
-                if db_item.prefer_format != list.prefer_format
-                    || db_item.allow_audio != list.allow_audio()
-                    || db_item.allow_ebook != list.allow_ebook()
+            Some(db_item) => {
+                let (mut db_item, settings_changed) = apply_list_settings(db_item, list);
+                if settings_changed
                     || db_item.title != item.title
                     || db_item.series.first() != item.series.as_ref()
                     || (db_item.book_url.is_none() && item.book_url.is_some())
                 {
-                    db_item.prefer_format = list.prefer_format;
-                    db_item.allow_audio = list.allow_audio();
-                    db_item.allow_ebook = list.allow_ebook();
                     db_item.title = item.title.clone();
                     db_item.series = item.series.iter().cloned().collect();
                     // Books stored without a link get the one from the widget
@@ -121,12 +135,7 @@ pub async fn run_goodreads_import(
                         rw.commit()?;
                     }
                 }
-                if (db_item.audio_torrent.is_some() && db_item.ebook_torrent.is_some())
-                    || (list.prefer_format == Some(OldDbMainCat::Audio)
-                        && db_item.audio_torrent.is_some())
-                    || (list.prefer_format == Some(OldDbMainCat::Ebook)
-                        && db_item.ebook_torrent.is_some())
-                {
+                if has_torrents(&db_item, list) {
                     continue;
                 }
                 db_item
@@ -147,7 +156,7 @@ pub async fn run_goodreads_import(
             &db,
             &mam,
             list,
-            &item,
+            item.book_id,
             db_item,
             max_torrents,
             &mut backoff,
@@ -155,13 +164,183 @@ pub async fn run_goodreads_import(
         .await
         .context("search goodreads book")?;
         // The books share the unsat slots that were free when the run started
-        max_torrents = max_torrents.saturating_sub(selected);
-        sleep(Duration::from_millis(400)).await;
+        if let Some(selected) = selected {
+            max_torrents = max_torrents.saturating_sub(selected);
+            // Only the books that were searched are paced
+            sleep(Duration::from_millis(400)).await;
+        }
+    }
+
+    if list.search_stored_books {
+        if read_whole_shelf(shelf_size) {
+            debug!(
+                "Goodreads list {list_id} has fewer than {WIDGET_BOOKS} books, so its other stored books have left the shelf and aren't searched"
+            );
+        } else if let Err(err) = search_stored_books(
+            &config,
+            &db,
+            &mam,
+            list,
+            &list_id,
+            &fetched,
+            &fetched_books,
+            max_torrents,
+            &mut backoff,
+        )
+        .await
+        {
+            // The import still ends normally, so the books it selected are downloaded. The other
+            // stored books are searched on the next import
+            warn!("Stopped searching for the stored books of Goodreads list {list_id}: {err:#}");
+        }
     }
 
     Ok(())
 }
 
+/// With `search_stored_books`, searches for the list's stored books that weren't in the fetched
+/// shelf the same way as for the books in it, until the import's unsat slots are used up
+#[allow(clippy::too_many_arguments)]
+async fn search_stored_books(
+    config: &Config,
+    db: &Database<'_>,
+    mam: &MaM<'_>,
+    list: &GoodreadsList,
+    list_id: &str,
+    fetched: &BTreeSet<String>,
+    fetched_books: &BTreeSet<u64>,
+    mut max_torrents: u64,
+    backoff: &mut Backoff<(String, String)>,
+) -> Result<()> {
+    let stored = stored_books(db, list_id, fetched, fetched_books)?;
+    for guid in stored {
+        // Without free slots nothing more is searched, so don't go through the rest
+        if max_torrents == 0 {
+            break;
+        }
+        // Read it again, earlier searches may take a while and other loops change list items
+        let Some(db_item) = db.r_transaction()?.get().primary::<ListItem>(guid)? else {
+            continue;
+        };
+        let (db_item, settings_changed) = apply_list_settings(db_item, list);
+        if settings_changed && !list.dry_run {
+            let (_guard, rw) = db.rw_async().await?;
+            rw.upsert(db_item.clone())?;
+            rw.commit()?;
+        }
+        if has_torrents(&db_item, list) {
+            continue;
+        }
+        trace!(
+            "Searching for stored book {} from Goodreads list",
+            db_item.title
+        );
+        let book_id = db_item.book_url.as_deref().and_then(book_id_from_url);
+        let key = db_item.guid.clone();
+        let selected = match search_item(
+            config,
+            db,
+            mam,
+            list,
+            book_id,
+            db_item,
+            max_torrents,
+            backoff,
+        )
+        .await
+        {
+            Ok(selected) => selected,
+            Err(err) => {
+                // Wait before searching for it again, as after a search that found nothing, so
+                // the next imports get to the stored books after it. Errors in the library check
+                // come before the wait is checked, so they still stop the pass at this book. A
+                // search MaM refused, or that wasn't sent while requests are paused, gets no wait
+                if !refused_or_paused(&err) {
+                    backoff.record(&key, false, Instant::now());
+                }
+                return Err(err.context("search stored goodreads book"));
+            }
+        };
+        if let Some(selected) = selected {
+            max_torrents = max_torrents.saturating_sub(selected);
+            sleep(Duration::from_millis(400)).await;
+        }
+    }
+    Ok(())
+}
+
+/// Most books the widget returns for a shelf, the most recently added
+const WIDGET_BOOKS: usize = 100;
+
+/// Whether the widget returned the whole shelf: fewer books than it can. Stored books that aren't
+/// among them have then left the shelf, so they aren't searched
+fn read_whole_shelf(shelf_size: usize) -> bool {
+    shelf_size < WIDGET_BOOKS
+}
+
+/// The list's stored books that weren't in the fetched shelf, in the list page's order (the ones
+/// MLM stored last first).
+/// Leaves out books in the shelf under another review, as when a book was removed from the
+/// shelf and added again
+fn stored_books(
+    db: &Database<'_>,
+    list_id: &str,
+    fetched: &BTreeSet<String>,
+    fetched_books: &BTreeSet<u64>,
+) -> Result<Vec<(String, String)>> {
+    let mut stored = vec![];
+    for item in db
+        .r_transaction()?
+        .scan()
+        .secondary::<ListItem>(ListItemKey::created_at)?
+        .all()?
+        .rev()
+    {
+        let item = item?;
+        if item.list_id != list_id || fetched.contains(&item.guid.1) {
+            continue;
+        }
+        let book_id = item.book_url.as_deref().and_then(book_id_from_url);
+        if book_id.is_some_and(|id| fetched_books.contains(&id)) {
+            continue;
+        }
+        stored.push(item.guid);
+    }
+    Ok(stored)
+}
+
+/// Whether a stored book already has a torrent for both formats, or for the list's preferred
+/// format, so the import doesn't search for it
+fn has_torrents(db_item: &ListItem, list: &GoodreadsList) -> bool {
+    (db_item.audio_torrent.is_some() && db_item.ebook_torrent.is_some())
+        || (list.prefer_format == Some(OldDbMainCat::Audio) && db_item.audio_torrent.is_some())
+        || (list.prefer_format == Some(OldDbMainCat::Ebook) && db_item.ebook_torrent.is_some())
+}
+
+/// Applies the list's current settings to a stored book, as the import does for the books in the
+/// fetched shelf. Returns the book and whether that changed it
+fn apply_list_settings(mut db_item: ListItem, list: &GoodreadsList) -> (ListItem, bool) {
+    let changed = db_item.prefer_format != list.prefer_format
+        || db_item.allow_audio != list.allow_audio()
+        || db_item.allow_ebook != list.allow_ebook();
+    db_item.prefer_format = list.prefer_format;
+    db_item.allow_audio = list.allow_audio();
+    db_item.allow_ebook = list.allow_ebook();
+    (db_item, changed)
+}
+
+/// The Goodreads book id in a book link such as `https://www.goodreads.com/book/show/123` or
+/// `.../book/show/123-title`
+fn book_id_from_url(url: &str) -> Option<u64> {
+    let (_, rest) = url.split_once("/book/show/")?;
+    let id: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    id.parse().ok()
+}
+
+/// Checks the library for a book and searches MaM for it if it's still wanted. Returns how many
+/// torrents it selected, or None when it stopped before searching: the book isn't wanted, the run
+/// has no slots left or it's waiting after earlier searches. A book without a title and author,
+/// or a list without grab blocks, gets Some(0) without a request
 #[instrument(skip_all)]
 #[allow(clippy::too_many_arguments)]
 async fn search_item(
@@ -169,13 +348,13 @@ async fn search_item(
     db: &Database<'_>,
     mam: &MaM<'_>,
     list: &GoodreadsList,
-    item: &Item,
+    book_id: Option<u64>,
     mut db_item: ListItem,
     max_torrents: u64,
     backoff: &mut Backoff<(String, String)>,
-) -> Result<u64> {
+) -> Result<Option<u64>> {
     if !db_item.want_audio() && !db_item.want_ebook() {
-        return Ok(0);
+        return Ok(None);
     }
 
     let has_updates = search_library(config, db, &mut db_item).context("search_library")?;
@@ -185,19 +364,19 @@ async fn search_item(
         rw.commit()?;
     }
     if !db_item.want_audio() && !db_item.want_ebook() {
-        return Ok(0);
+        return Ok(None);
     }
 
     // This run has used all its unsat slots, search again on the next one
     if max_torrents == 0 {
-        return Ok(0);
+        return Ok(None);
     }
     if backoff.waiting(&db_item.guid, Instant::now()) {
         trace!(
             "Not searching for {} yet, earlier searches found nothing",
             db_item.title
         );
-        return Ok(0);
+        return Ok(None);
     }
 
     let torrents = search_grabs(config, mam, &db_item, &list.grab)
@@ -268,7 +447,7 @@ async fn search_item(
             None,
             list.dry_run,
             max_torrents,
-            item.book_id,
+            book_id,
         )
         .await
         .context("select_torrents")?;
@@ -307,7 +486,7 @@ async fn search_item(
             None,
             list.dry_run,
             max_torrents - selected_torrents,
-            item.book_id,
+            book_id,
         )
         .await
         .context("select_torrents")?;
@@ -322,7 +501,7 @@ async fn search_item(
         selected_torrents += selection.selected;
     }
 
-    Ok(selected_torrents)
+    Ok(Some(selected_torrents))
 }
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
@@ -404,7 +583,7 @@ fn widget_url(list_url: &str, widget_id: &str) -> Result<Option<String>> {
     ))?;
     url.query_pairs_mut()
         .append_pair("shelf", &shelf)
-        .append_pair("num_books", "100")
+        .append_pair("num_books", &WIDGET_BOOKS.to_string())
         .append_pair("sort", "date_added")
         .append_pair("order", "d")
         .append_pair("show_author", "1")
@@ -525,7 +704,11 @@ fn parse_widget(content: &str, list_id: &str) -> Result<Rss> {
     }
 
     Ok(Rss {
-        channel: Channel { title, items },
+        channel: Channel {
+            title,
+            items,
+            entries: Some(fragment.select(&each_selector).count()),
+        },
     })
 }
 
@@ -582,6 +765,9 @@ struct Channel {
     title: String,
     #[serde(rename = "item")]
     items: Vec<Item>,
+    /// How many books the widget listed, including any MLM couldn't read. None for RSS
+    #[serde(skip)]
+    entries: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -843,6 +1029,7 @@ mod tests {
         let rss = parse_widget(WIDGET, "1:to-read").unwrap();
         assert_eq!(rss.channel.title, "Jane's bookshelf: to-read");
         assert_eq!(rss.channel.items.len(), 2);
+        assert_eq!(rss.channel.entries, Some(2));
 
         let item = &rss.channel.items[0];
         assert_eq!(
@@ -878,6 +1065,16 @@ mod tests {
         let rss = parse_widget(EMPTY_WIDGET, "1:no-such-shelf").unwrap();
         assert_eq!(rss.channel.title, "Jane's bookshelf: no-such-shelf");
         assert!(rss.channel.items.is_empty());
+        assert_eq!(rss.channel.entries, Some(0));
+    }
+
+    #[test]
+    fn test_widget_entries_count_unreadable_books() {
+        // A book without a review link isn't read, but the widget still listed it
+        let widget = WIDGET.replacen("/review/show/123?", "/book/show/123?", 1);
+        let rss = parse_widget(&widget, "1:to-read").unwrap();
+        assert_eq!(rss.channel.items.len(), 1);
+        assert_eq!(rss.channel.entries, Some(2));
     }
 
     #[test]
@@ -1086,6 +1283,126 @@ mod tests {
         assert!(!item.want_audio());
     }
 
+    fn audiobook_list(toml_extra: &str) -> GoodreadsList {
+        toml::from_str(&format!(
+            "url = \"https://www.goodreads.com/review/list/1?shelf=to-read\"\n{toml_extra}\n{AUDIOBOOK_GRABS}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_search_stored_books_setting() {
+        assert!(!audiobook_list("").search_stored_books);
+        assert!(audiobook_list("search_stored_books = true").search_stored_books);
+    }
+
+    #[test]
+    fn test_book_id_from_url() {
+        let book = "https://www.goodreads.com/book/show/";
+        for (url, id) in [
+            (format!("{book}87654321"), Some(87654321)),
+            (format!("{book}123-the-example-book"), Some(123)),
+            (format!("{book}123.The_Example_Book?ac=1"), Some(123)),
+            (book.to_owned(), None),
+            (
+                "https://www.goodreads.com/review/show/1000000001".to_owned(),
+                None,
+            ),
+        ] {
+            assert_eq!(book_id_from_url(&url), id, "{url}");
+        }
+    }
+
+    #[test]
+    fn test_stored_book_gets_list_settings() {
+        // The list only grabs audiobooks, so a book stored while it took ebooks too stops wanting
+        // the ebook
+        let list = audiobook_list("prefer_format = \"audio\"");
+        let item = list_item("The Example Book", &["Ann Author"]);
+        assert!(item.want_ebook());
+        let (item, changed) = apply_list_settings(item, &list);
+        assert!(changed);
+        assert_eq!(
+            (item.prefer_format, item.allow_audio, item.allow_ebook),
+            (Some(OldDbMainCat::Audio), true, false)
+        );
+        assert!(item.want_audio() && !item.want_ebook());
+        // Applying them again changes nothing
+        let (_, changed) = apply_list_settings(item, &list);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn test_stored_books() {
+        let db = native_db::Builder::new()
+            .create_in_memory(&mlm_db::MODELS)
+            .unwrap();
+        let now = time::UtcDateTime::now();
+        let book = |list: &str, guid: &str, hours_ago: i64, book_id: Option<&str>| ListItem {
+            guid: (list.to_owned(), guid.to_owned()),
+            list_id: list.to_owned(),
+            book_url: book_id.map(|id| format!("https://www.goodreads.com/book/show/{id}")),
+            created_at: Timestamp::from(now - time::Duration::hours(hours_ago)),
+            ..list_item(guid, &["Ann Author"])
+        };
+        let rw = db.rw_transaction().unwrap();
+        for item in [
+            book("list", "in the shelf", 1, Some("1")),
+            book("list", "in the shelf without a cover", 6, None),
+            book("list", "older", 3, Some("2")),
+            book("list", "newer", 2, Some("3-the-example-book")),
+            book("list", "without a link", 5, None),
+            book("other list", "of another list", 0, None),
+            // Removed from the shelf and added again, so it's in the shelf under another review
+            book("list", "added again", 4, Some("4")),
+        ] {
+            rw.insert(item).unwrap();
+        }
+        rw.commit().unwrap();
+
+        let fetched = [
+            "in the shelf",
+            "in the shelf without a cover",
+            "added again, new review",
+        ]
+        .map(str::to_owned)
+        .into();
+        let fetched_books = [1, 4].into();
+        let stored = stored_books(&db, "list", &fetched, &fetched_books).unwrap();
+        let guids: Vec<_> = stored.iter().map(|guid| guid.1.as_str()).collect();
+        assert_eq!(guids, ["newer", "older", "without a link"]);
+        assert!(stored.iter().all(|guid| guid.0 == "list"));
+    }
+
+    #[test]
+    fn test_read_whole_shelf() {
+        assert!(read_whole_shelf(0));
+        assert!(read_whole_shelf(99));
+        assert!(!read_whole_shelf(100));
+    }
+
+    #[test]
+    fn test_has_torrents() {
+        let found = |status| ListItemTorrent {
+            mam_id: 1,
+            status,
+            at: Timestamp::now(),
+        };
+        let audio_list = audiobook_list("prefer_format = \"audio\"");
+        let any_list = audiobook_list("");
+        let mut item = list_item("The Example Book", &["Ann Author"]);
+        assert!(!has_torrents(&item, &audio_list));
+
+        // An audiobook is enough when the list prefers audiobooks, not otherwise
+        item.audio_torrent = Some(found(TorrentStatus::Selected));
+        assert!(has_torrents(&item, &audio_list));
+        assert!(!has_torrents(&item, &any_list));
+
+        // Both formats are enough for any list
+        item.ebook_torrent = Some(found(TorrentStatus::Existing));
+        assert!(has_torrents(&item, &any_list));
+    }
+
     /// Fetches a real shelf and another shelf of the same user through the widget, run with
     /// GOODREADS_RSS_URL=... cargo test -p mlm live_widget -- --ignored --nocapture
     #[tokio::test]
@@ -1096,6 +1413,7 @@ mod tests {
             name: None,
             prefer_format: None,
             grab: vec![],
+            search_stored_books: false,
             search_interval: None,
             unsat_buffer: None,
             wedge_buffer: None,
