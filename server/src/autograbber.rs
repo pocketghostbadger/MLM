@@ -456,7 +456,7 @@ pub async fn select_torrents<T: Iterator<Item = MaMTorrent>>(
         }
         let Some(torrent_cost) = selection_cost(cost, &torrent) else {
             debug!(
-                "Skipping torrent {} as its grab block's cost doesn't allow it (not free, or VIP without a free flag), cost: {:?}",
+                "Skipping torrent {} as it is not free, cost: {:?}",
                 torrent.id, cost
             );
             continue 'torrent;
@@ -486,6 +486,15 @@ pub async fn select_torrents<T: Iterator<Item = MaMTorrent>>(
             if let Some(rw) = rw_opt {
                 add_metadata_only_torrent(rw, torrent, meta, false).await?;
             }
+            continue 'torrent;
+        }
+        // No block selects it, but it's checked after the snatched step, so one the account
+        // already snatched is still stored without files
+        if vip_not_free(&torrent) {
+            debug!(
+                "Skipping torrent {} as it is VIP without a free flag, cost: {:?}",
+                torrent.id, cost
+            );
             continue 'torrent;
         }
         if let Some((_, rw)) = &rw_opt {
@@ -658,11 +667,11 @@ pub async fn select_torrents<T: Iterator<Item = MaMTorrent>>(
 /// then, and without a wedge while it's free. A `wedge` block stores it as free because a wedge
 /// selection waits while there are no wedges to spare, even for a torrent that's free (#32).
 ///
-/// No block selects a VIP torrent without any of the free flags (`vip_not_free`)
+/// `select_torrents` skips a VIP torrent without any of the free flags (`vip_not_free`) after this,
+/// once it has stored one the account already snatched
 fn selection_cost(cost: Cost, torrent: &MaMTorrent) -> Option<TorrentCost> {
     match cost {
         Cost::MetadataOnly | Cost::MetadataOnlyAdd => None,
-        _ if vip_not_free(torrent) => None,
         Cost::Free => free_cost(torrent),
         Cost::Wedge => Some(free_cost(torrent).unwrap_or(TorrentCost::UseWedge)),
         Cost::TryWedge => Some(TorrentCost::TryWedge),
@@ -1082,6 +1091,39 @@ mod tests {
         assert!(stored(&db, 1).is_none());
     }
 
+    #[tokio::test]
+    async fn test_vip_without_free_flag() {
+        let vip_only = |id, my_snatched| MaMTorrent {
+            vip: true,
+            ..audiobook(id, "Book", "m4b", my_snatched)
+        };
+        for cost in [Cost::Wedge, Cost::TryWedge, Cost::Ratio] {
+            // Not selected
+            let db = database();
+            let selection = select(&db, vec![vip_only(1, false)], cost, false).await;
+            assert_eq!(selection, Selection::default());
+            assert!(selected(&db, 1).is_none());
+            assert!(stored(&db, 1).is_none());
+
+            // Already snatched, it's stored without files, and another upload of the book isn't
+            // selected
+            let db = database();
+            let selection = select(&db, vec![vip_only(1, true)], cost, false).await;
+            assert_eq!(selection.snatched, 1);
+            assert!(stored(&db, 1).is_some());
+            let selection =
+                select(&db, vec![audiobook(2, "Book", "m4b", false)], cost, false).await;
+            assert_eq!(selection, Selection::default());
+            assert!(selected(&db, 2).is_none());
+        }
+
+        // A free block skips it before the snatched step, since it isn't free
+        let db = database();
+        let selection = select(&db, vec![vip_only(1, true)], Cost::Free, false).await;
+        assert_eq!(selection, Selection::default());
+        assert!(stored(&db, 1).is_none());
+    }
+
     #[test]
     fn test_selection_cost() {
         let plain = MaMTorrent::default();
@@ -1140,11 +1182,13 @@ mod tests {
         );
         assert_eq!(selection_cost(Cost::Free, &plain), None);
 
-        // VIP without any of the free flags may be one the account can't download, so no block
-        // selects it
-        for cost in [Cost::Free, Cost::Wedge, Cost::TryWedge, Cost::Ratio] {
-            assert_eq!(selection_cost(cost, &vip_only), None);
-        }
+        // VIP without any of the free flags isn't free. select_torrents skips it for the other
+        // blocks too, after the snatched step
+        assert_eq!(selection_cost(Cost::Free, &vip_only), None);
+        assert_eq!(
+            selection_cost(Cost::Wedge, &vip_only),
+            Some(TorrentCost::UseWedge)
+        );
 
         // Metadata only blocks don't download anything
         for cost in [Cost::MetadataOnly, Cost::MetadataOnlyAdd] {

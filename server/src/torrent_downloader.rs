@@ -197,7 +197,8 @@ fn picks_up_again(torrent: &SelectedTorrent, err: &anyhow::Error) -> bool {
 
 /// Drops a selection the downloader can't grab. One that `picks_up_again` is deleted, and the list
 /// items that selected it no longer show it as selected, so the next import searches for them
-/// again. Others are marked removed
+/// again. Others are marked removed, and so is one removed on the selected page while it was being
+/// grabbed
 async fn drop_selection(
     db: &Database<'_>,
     torrent: &SelectedTorrent,
@@ -205,7 +206,7 @@ async fn drop_selection(
 ) -> Result<()> {
     let (_guard, rw) = db.rw_async().await?;
     if let Some(mut stored) = rw.get().primary::<SelectedTorrent>(torrent.mam_id)? {
-        if picks_up_again(torrent, err) {
+        if picks_up_again(torrent, err) && stored.removed_at.is_none() {
             info!(
                 "Dropping torrent \"{}\" ({err}), it can be selected again",
                 torrent.meta.title
@@ -1436,5 +1437,26 @@ mod tests {
                 [Some((1, TorrentStatus::Selected)), None]
             );
         }
+
+        // So is one removed on the selected page while it was being grabbed
+        let db = database();
+        put(
+            &db,
+            SelectedTorrent {
+                removed_at: Some(Timestamp::now()),
+                ..selection.clone()
+            },
+        );
+        put(&db, list_item("a", found(1, TorrentStatus::Selected), None));
+        drop_selection(&db, &selection, &no_longer_free())
+            .await
+            .unwrap();
+        let selections = stored::<SelectedTorrent>(&db);
+        assert_eq!(selections.len(), 1);
+        assert!(selections[0].removed_at.is_some());
+        assert_eq!(
+            status(&stored::<mlm_db::ListItem>(&db), "a"),
+            [Some((1, TorrentStatus::Selected)), None]
+        );
     }
 }
