@@ -25,7 +25,7 @@ use crate::{
     autograbber::{select_torrents, vip_not_free},
     backoff::Backoff,
     config::{Config, Cost, GoodreadsList, Grab},
-    lists::{search_grabs, search_library},
+    lists::{search_grabs, search_library, skip_undecodable, skip_undecodable_items},
 };
 
 pub static SERIES_PATTERN: Lazy<Regex> =
@@ -111,11 +111,22 @@ pub async fn run_goodreads_import(
         {
             item.series = Some((series_name, *num));
         }
-        let db_item = match db
+        let stored = db
             .r_transaction()?
             .get()
-            .primary::<ListItem>((list_id.clone(), item.guid.clone()))?
-        {
+            .primary::<ListItem>((list_id.clone(), item.guid.clone()));
+        // A stored item MLM can't decode can't be overwritten either, so the book is left out
+        let Some(stored) = skip_undecodable(
+            stored,
+            format_args!(
+                "the stored list item of {:?} in Goodreads list {list_id}",
+                item.title
+            ),
+        )?
+        else {
+            continue;
+        };
+        let db_item = match stored {
             Some(db_item) => {
                 let (mut db_item, settings_changed) = apply_list_settings(db_item, list);
                 if settings_changed
@@ -219,7 +230,15 @@ async fn search_stored_books(
             break;
         }
         // Read it again, earlier searches may take a while and other loops change list items
-        let Some(db_item) = db.r_transaction()?.get().primary::<ListItem>(guid)? else {
+        let stored = db.r_transaction()?.get().primary::<ListItem>(guid.clone());
+        let Some(Some(db_item)) = skip_undecodable(
+            stored,
+            format_args!(
+                "the stored list item {:?} of Goodreads list {list_id}",
+                guid.1
+            ),
+        )?
+        else {
             continue;
         };
         let (db_item, settings_changed) = apply_list_settings(db_item, list);
@@ -289,14 +308,15 @@ fn stored_books(
     fetched_books: &BTreeSet<u64>,
 ) -> Result<Vec<(String, String)>> {
     let mut stored = vec![];
-    for item in db
-        .r_transaction()?
-        .scan()
-        .secondary::<ListItem>(ListItemKey::created_at)?
-        .all()?
-        .rev()
-    {
-        let item = item?;
+    let items = skip_undecodable_items(
+        db.r_transaction()?
+            .scan()
+            .secondary::<ListItem>(ListItemKey::created_at)?
+            .all()?
+            .rev(),
+        "stored list items",
+    )?;
+    for item in items {
         if item.list_id != list_id || fetched.contains(&item.guid.1) {
             continue;
         }
@@ -953,7 +973,10 @@ mod tests {
     use super::*;
     use crate::lists::{
         GrabMatches, grab_matches,
-        tests::{AUDIOBOOK_GRABS, audiobook, config, ebook, grabs, list_item},
+        tests::{
+            AUDIOBOOK_GRABS, audiobook, config, database_with_undecodable_item, ebook, grabs,
+            list_item,
+        },
     };
 
     // Same markup as Goodreads returns, with made up books
@@ -1372,6 +1395,17 @@ mod tests {
         let guids: Vec<_> = stored.iter().map(|guid| guid.1.as_str()).collect();
         assert_eq!(guids, ["newer", "older", "without a link"]);
         assert!(stored.iter().all(|guid| guid.0 == "list"));
+    }
+
+    #[test]
+    fn test_stored_books_skip_undecodable_item() {
+        let db = database_with_undecodable_item("list", "damaged");
+        let rw = db.rw_transaction().unwrap();
+        rw.insert(list_item("stored", &["Ann Author"])).unwrap();
+        rw.commit().unwrap();
+
+        let stored = stored_books(&db, "list", &BTreeSet::new(), &BTreeSet::new()).unwrap();
+        assert_eq!(stored, [("list".to_owned(), "stored".to_owned())]);
     }
 
     #[test]

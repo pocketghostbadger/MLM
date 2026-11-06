@@ -1,7 +1,7 @@
 mod goodreads;
 mod notion;
 
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{borrow::Cow, fmt::Display, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use itertools::Itertools;
@@ -209,11 +209,8 @@ fn update_selected_items(
     mam_id: u64,
     change: impl Fn(&mut Option<ListItemTorrent>),
 ) -> Result<()> {
-    let items = rw
-        .scan()
-        .primary::<ListItem>()?
-        .all()?
-        .collect::<Result<Vec<_>, _>>()?;
+    let items =
+        skip_undecodable_items(rw.scan().primary::<ListItem>()?.all()?, "stored list items")?;
     for mut item in items {
         let mut updated = false;
         for field in [&mut item.audio_torrent, &mut item.ebook_torrent] {
@@ -230,6 +227,49 @@ fn update_selected_items(
         }
     }
     Ok(())
+}
+
+/// A record read from the database, or None, with a warning, when MLM can't decode it, so that a
+/// damaged record, or one stored before a change to its model without a new model version,
+/// doesn't stop the loops that read it. Other database errors are returned
+fn skip_undecodable<T>(
+    read: Result<T, native_db::db_type::Error>,
+    what: impl Display,
+) -> Result<Option<T>> {
+    match read {
+        Ok(value) => Ok(Some(value)),
+        Err(native_db::db_type::Error::ModelError(err)) => {
+            warn!("Skipped {what}: MLM can't decode it ({err})");
+            Ok(None)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// The records of a scan that MLM can decode, as `skip_undecodable` does for one record, with one
+/// warning for all it skipped. The warning can't name them: the scan doesn't give the key of a
+/// record it can't decode
+fn skip_undecodable_items<T>(
+    items: impl Iterator<Item = Result<T, native_db::db_type::Error>>,
+    what: &str,
+) -> Result<Vec<T>> {
+    let mut decoded = vec![];
+    let mut skipped = 0;
+    let mut last_error = None;
+    for item in items {
+        match item {
+            Ok(item) => decoded.push(item),
+            Err(native_db::db_type::Error::ModelError(err)) => {
+                skipped += 1;
+                last_error = Some(err);
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    if let Some(err) = last_error {
+        warn!("Skipped {what} that MLM can't decode: {skipped} ({err})");
+    }
+    Ok(decoded)
 }
 
 /// Results per search page, the search endpoint allows 5 to 1000
@@ -593,8 +633,12 @@ fn grab_matches(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use mlm_db::{AudiobookCategory, EbookCategory, Language, Size, Timestamp};
-    use serde::Deserialize;
+    use native_db::{ToKey, native_db};
+    use native_model::{Model, native_model};
+    use serde::{Deserialize, Serialize};
     use time::macros::date;
 
     use super::*;
@@ -866,5 +910,133 @@ mod tests {
         )
         .unwrap();
         assert!(found.is_empty());
+    }
+
+    /// A record in `ListItem`'s tables, with its keys but none of its other fields, so it can't be
+    /// decoded as a `ListItem`
+    #[derive(Serialize, Deserialize, Debug)]
+    #[native_model(id = 8, version = 5)]
+    #[native_db]
+    struct Undecodable {
+        #[primary_key]
+        guid: (String, String),
+        #[secondary_key]
+        list_id: String,
+        #[secondary_key]
+        created_at: Timestamp,
+    }
+
+    /// A database with a list item MLM can't decode in list `list_id` under `guid`, as one stored
+    /// before a change to `ListItem` without a new model version would be
+    pub(super) fn database_with_undecodable_item(list_id: &str, guid: &str) -> Database<'static> {
+        // The record has to be stored as the current ListItem model
+        assert_eq!(
+            (
+                ListItem::native_model_id(),
+                ListItem::native_model_version()
+            ),
+            (8, 5)
+        );
+        static DATABASES: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "mlm-test-undecodable-{}-{}.redb",
+            std::process::id(),
+            DATABASES.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut models = native_db::Models::new();
+        models.define::<Undecodable>().unwrap();
+        let db = native_db::Builder::new().create(&models, &path).unwrap();
+        let rw = db.rw_transaction().unwrap();
+        rw.insert(Undecodable {
+            guid: (list_id.to_owned(), guid.to_owned()),
+            list_id: list_id.to_owned(),
+            created_at: Timestamp::now(),
+        })
+        .unwrap();
+        rw.commit().unwrap();
+        drop(db);
+        let db = native_db::Builder::new()
+            .open(&mlm_db::MODELS, &path)
+            .unwrap();
+        // Deleted while open, the file goes once the database is dropped. Rust opens files with
+        // delete sharing on Windows too
+        let _ = std::fs::remove_file(&path);
+        db
+    }
+
+    #[test]
+    fn test_skip_undecodable() {
+        let db = database_with_undecodable_item("list", "damaged");
+        let r = db.r_transaction().unwrap();
+        let read = r
+            .get()
+            .primary::<ListItem>(("list".to_owned(), "damaged".to_owned()));
+        assert!(matches!(
+            read,
+            Err(native_db::db_type::Error::ModelError(_))
+        ));
+        assert!(matches!(skip_undecodable(read, "item"), Ok(None)));
+        assert!(matches!(skip_undecodable(Ok(1), "item"), Ok(Some(1))));
+        // Other database errors are still errors
+        let err =
+            skip_undecodable::<()>(Err(native_db::db_type::Error::PrimaryKeyNotFound), "item")
+                .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<native_db::db_type::Error>(),
+            Some(native_db::db_type::Error::PrimaryKeyNotFound)
+        ));
+    }
+
+    #[test]
+    fn test_skip_undecodable_items() {
+        let undecodable =
+            || native_db::db_type::Error::ModelError(native_model::Error::DecodeError);
+        let items = [Ok(1), Err(undecodable()), Ok(2), Err(undecodable())];
+        assert_eq!(
+            skip_undecodable_items(items.into_iter(), "items").unwrap(),
+            [1, 2]
+        );
+        // Other database errors are still errors
+        let items = [Ok(1), Err(native_db::db_type::Error::PrimaryKeyNotFound)];
+        let err = skip_undecodable_items(items.into_iter(), "items").unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<native_db::db_type::Error>(),
+            Some(native_db::db_type::Error::PrimaryKeyNotFound)
+        ));
+    }
+
+    #[test]
+    fn test_selected_items_skip_undecodable_item() {
+        let db = database_with_undecodable_item("list", "damaged");
+        let selected = |mam_id| {
+            Some(ListItemTorrent {
+                mam_id,
+                status: TorrentStatus::Selected,
+                at: Timestamp::now(),
+            })
+        };
+        let rw = db.rw_transaction().unwrap();
+        rw.insert(ListItem {
+            audio_torrent: selected(1),
+            ebook_torrent: selected(2),
+            ..list_item("The Example Book", &["Ann Author"])
+        })
+        .unwrap();
+        clear_dropped_selection(&rw, 1).unwrap();
+        mark_snatched_existing(&rw, 2).unwrap();
+        rw.commit().unwrap();
+
+        let item = db
+            .r_transaction()
+            .unwrap()
+            .get()
+            .primary::<ListItem>(("list".to_owned(), "The Example Book".to_owned()))
+            .unwrap()
+            .unwrap();
+        assert!(item.audio_torrent.is_none());
+        assert_eq!(
+            item.ebook_torrent.map(|t| t.status),
+            Some(TorrentStatus::Existing)
+        );
     }
 }
